@@ -41,6 +41,35 @@ The same behavior is covered by the normal test suite:
 python3 -m unittest tests.test_profile_integration -v
 ```
 
+## Gateway, cron and subagent process paths
+
+The separate process-path runner verifies the credential boundary at the
+independent Hermes initialization seams used by gateway startup, multiplexed
+profile turns, scheduled execution and delegated children:
+
+```bash
+python3 scripts/run_process_path_integration.py
+```
+
+Each path runs in its own subprocess with disposable profiles, the real plugin
+manager, real secret-source orchestration and synthetic `bw` executables. The
+gateway check verifies startup discovery and application. The multiplexed check
+discovers the plugin independently for two profiles, hydrates separate secret
+snapshots and enters Hermes' real per-profile runtime scopes. The cron check
+uses Hermes' profile cron scope and the same scoped-secret construction used by
+the job execution seam. The subagent check uses Hermes' child-runtime credential
+resolver and the context-copy behavior used by delegated worker threads.
+
+Every check places a different value in the ambient process environment and
+fails unless the profile-owned value wins. The multiplexed check additionally
+fails unless both profiles resolve their own different value. All scopes must
+be removed after the path returns. The final JSON contains only booleans and
+path names; workers' synthetic values and bootstrap material are never emitted.
+
+These probes establish a portable contract against the installed Hermes
+runtime. They do not replace the deployment checkpoint required before a
+production credential migration.
+
 ## Operational evidence boundary
 
 This check is portable evidence for the repository contract. It does not claim
