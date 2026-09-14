@@ -38,6 +38,7 @@ Run the mandatory local checks with:
 ```bash
 python3 -m unittest discover -s tests -v
 python3 scripts/run_profile_integration.py
+python3 scripts/run_process_path_integration.py
 PYTHONPATH="${PROJECT_ROOT}:${HERMES_AGENT_SRC}" \
   python3 -m unittest discover -s tests -p 'test_hermes_contract.py' -v
 python3 scripts/check_repository_safety.py
