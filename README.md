@@ -7,8 +7,22 @@ persisting plaintext credentials in Hermes profile files.
 
 ## Status
 
-Design and security baseline. Implementation begins after the documented design
-gates are approved.
+The portable directory plugin and its synthetic unit/contract tests are
+implemented. Live test-scope integration and service deployment remain separate
+gated tasks.
+
+## Plugin
+
+Deploy `vaultwarden_secret_source/` unchanged as a directory below
+`${HERMES_HOME}/plugins/`. It implements Hermes Secret Source API v1 and uses
+the externally managed Bitwarden CLI pinned for this release to version
+`2026.8.0` and to operator-supplied SHA-256 digests for its executable and any
+script interpreter. Verified bytes execute from sealed in-memory files. The
+plugin never installs a binary, persists a session key, or writes to the process
+environment directly.
+
+Configuration, allowlist semantics, supported fields, bootstrap variables and
+failure behavior are documented in [docs/configuration.md](docs/configuration.md).
 
 ## Security boundary
 
@@ -21,6 +35,8 @@ Run the mandatory local checks with:
 
 ```bash
 python3 -m unittest discover -s tests -v
+PYTHONPATH="${PROJECT_ROOT}:${HERMES_AGENT_SRC}" \
+  python3 -m unittest discover -s tests -p 'test_hermes_contract.py' -v
 python3 scripts/check_repository_safety.py
 git diff --cached --check
 ```

@@ -1,0 +1,14 @@
+manifest_version: 2
+api_version: 1
+name: vaultwarden-secret-source
+version: "0.1.0"
+description: "Allowlisted Vaultwarden secret source for Hermes Agent"
+kind: standalone
+platforms: [linux]
+external_dependencies:
+  - "bw-cli-version: 2026.8.0"
+  - "bw-cli-sha256: required-config"
+  - "bw-cli-script-interpreter-sha256: required-if-script"
+tags:
+  - secrets
+  - vaultwarden
