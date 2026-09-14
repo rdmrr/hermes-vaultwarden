@@ -7,9 +7,9 @@ persisting plaintext credentials in Hermes profile files.
 
 ## Status
 
-The portable directory plugin and its synthetic unit/contract tests are
-implemented. Live test-scope integration and service deployment remain separate
-gated tasks.
+The portable directory plugin, its synthetic unit/contract tests, and a
+disposable Hermes profile integration check are implemented. Host-specific
+service deployment remains a separate gated task.
 
 ## Plugin
 
@@ -23,6 +23,8 @@ environment directly.
 
 Configuration, allowlist semantics, supported fields, bootstrap variables and
 failure behavior are documented in [docs/configuration.md](docs/configuration.md).
+The portable profile, rotation and fail-open integration procedure is documented
+in [docs/testing.md](docs/testing.md).
 
 ## Security boundary
 
@@ -35,6 +37,7 @@ Run the mandatory local checks with:
 
 ```bash
 python3 -m unittest discover -s tests -v
+python3 scripts/run_profile_integration.py
 PYTHONPATH="${PROJECT_ROOT}:${HERMES_AGENT_SRC}" \
   python3 -m unittest discover -s tests -p 'test_hermes_contract.py' -v
 python3 scripts/check_repository_safety.py
