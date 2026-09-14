@@ -272,6 +272,171 @@ class ValidationTests(unittest.TestCase):
 
 
 class FetchTests(unittest.TestCase):
+    def test_staging_closes_reader_fd_when_identity_check_fails(self):
+        module = _load_plugin()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source"
+            source.write_bytes(b"#!/bin/true\n")
+            source.chmod(0o500)
+            digest = hashlib.sha256(source.read_bytes()).hexdigest()
+            real_fstat = module.os.fstat
+            calls = 0
+
+            def fail_reader_fstat(fd):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise OSError("synthetic reader fstat failure")
+                return real_fstat(fd)
+
+            open_fds_before = len(os.listdir("/proc/self/fd"))
+            with mock.patch.object(module.os, "fstat", side_effect=fail_reader_fstat):
+                with self.assertRaises(module._BwFailure):
+                    module._open_verified_fd(
+                        source,
+                        root / "staged",
+                        digest,
+                        "test executable",
+                        time.monotonic() + 10,
+                    )
+            self.assertEqual(open_fds_before, len(os.listdir("/proc/self/fd")))
+
+    def test_pinned_script_closes_interpreter_fd_when_format_read_fails(self):
+        module = _load_plugin()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            interpreter = Path(sys.executable).resolve()
+            script = root / "bw"
+            script.write_text(f"#!{interpreter}\n", encoding="utf-8")
+            script.chmod(0o500)
+            cfg = {
+                "binary_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+                "binary_interpreter_sha256": hashlib.sha256(interpreter.read_bytes()).hexdigest(),
+            }
+            real_pread = module.os.pread
+
+            def fail_interpreter_pread(fd, size, offset):
+                if size == 4:
+                    raise OSError("synthetic interpreter pread failure")
+                return real_pread(fd, size, offset)
+
+            open_fds_before = len(os.listdir("/proc/self/fd"))
+            with mock.patch.object(module.os, "pread", side_effect=fail_interpreter_pread):
+                with self.assertRaises(OSError):
+                    module._open_pinned_executable(
+                        script,
+                        cfg,
+                        time.monotonic() + 10,
+                    )
+            self.assertEqual(open_fds_before, len(os.listdir("/proc/self/fd")))
+
+    def test_pinned_executable_retries_transient_stage_cleanup_failure(self):
+        module = _load_plugin()
+        binary = Path(sys.executable).resolve()
+        executable = module._open_pinned_executable(
+            binary,
+            {"binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()},
+            time.monotonic() + 10,
+        )
+        staged_root = executable.binary_path.parent
+        real_cleanup = executable.stage_dir.cleanup
+        calls = 0
+
+        def flaky_cleanup():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise OSError("synthetic transient cleanup failure")
+            real_cleanup()
+
+        with mock.patch.object(executable.stage_dir, "cleanup", side_effect=flaky_cleanup):
+            executable.close()
+
+        self.assertEqual(2, calls)
+        self.assertFalse(staged_root.exists())
+
+    def test_pinned_executable_reports_persistent_stage_cleanup_failure(self):
+        module = _load_plugin()
+        binary = Path(sys.executable).resolve()
+        executable = module._open_pinned_executable(
+            binary,
+            {"binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest()},
+            time.monotonic() + 10,
+        )
+        real_cleanup = executable.stage_dir.cleanup
+
+        try:
+            with mock.patch.object(
+                executable.stage_dir,
+                "cleanup",
+                side_effect=OSError("synthetic persistent cleanup failure"),
+            ):
+                self.assertIs(executable.close(), False)
+        finally:
+            real_cleanup()
+
+    def test_pinned_native_executable_can_reopen_its_proc_exe_target(self):
+        module = _load_plugin()
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_file = root / "self_reopening_bw.c"
+            binary = root / "bw"
+            source_file.write_text(
+                "#include <fcntl.h>\n"
+                "#include <limits.h>\n"
+                "#include <stdio.h>\n"
+                "#include <sys/stat.h>\n"
+                "#include <unistd.h>\n"
+                "int main(void) {\n"
+                "    char target[PATH_MAX];\n"
+                "    ssize_t size = readlink(\"/proc/self/exe\", target, sizeof(target) - 1);\n"
+                "    if (size < 0) return 41;\n"
+                "    target[size] = '\\0';\n"
+                "    int fd = open(target, O_RDONLY | O_CLOEXEC);\n"
+                "    if (fd < 0) return 42;\n"
+                "    struct stat reopened;\n"
+                "    struct stat running;\n"
+                "    if (fstat(fd, &reopened) < 0) return 43;\n"
+                "    if (stat(\"/proc/self/exe\", &running) < 0) return 44;\n"
+                "    if (reopened.st_dev != running.st_dev || reopened.st_ino != running.st_ino) return 45;\n"
+                "    close(fd);\n"
+                "    puts(\"2026.8.0\");\n"
+                "    return 0;\n"
+                "}\n",
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["cc", "-O2", "-o", str(binary), str(source_file)],
+                check=True,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            cfg = {
+                "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+            }
+            executable = module._open_pinned_executable(
+                binary,
+                cfg,
+                time.monotonic() + 10,
+            )
+            staged_root = executable.binary_path.parent
+
+            try:
+                proc = module._run_pinned_bw(
+                    executable,
+                    ["--version"],
+                    env={"NO_COLOR": "1"},
+                    cli_timeout=5,
+                    deadline=time.monotonic() + 10,
+                )
+                self.assertEqual("2026.8.0", proc.stdout.strip())
+            finally:
+                executable.close()
+
+            self.assertFalse(staged_root.exists())
+
     def test_output_read_failure_kills_credential_bearing_process_group(self):
         module = _load_plugin()
         source = module.VaultwardenSource()
@@ -509,6 +674,7 @@ class FetchTests(unittest.TestCase):
                 "    assert 'BW_CLIENTID' not in os.environ\n"
                 "    assert 'BW_CLIENTSECRET' not in os.environ\n"
                 "    assert 'BW_PASSWORD' not in os.environ\n"
+                "    assert os.path.isdir(os.environ['BITWARDENCLI_APPDATA_DIR'])\n"
                 "    print('2026.8.0')\n"
                 "    raise SystemExit(0)\n"
                 "if args[:2] == ['config', 'server']:\n"

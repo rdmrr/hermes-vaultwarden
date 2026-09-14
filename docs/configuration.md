@@ -5,12 +5,24 @@ that directory unchanged as `${HERMES_HOME}/plugins/vaultwarden-secret-source/`.
 The runtime dependency is the externally managed Bitwarden CLI version
 `2026.8.0`; the plugin never downloads or updates executables. The absolute,
 non-symlink binary path and its lowercase SHA-256 digest are both mandatory.
-The verified bytes are copied into a sealed in-memory file and every invocation
-executes that immutable file descriptor, including after bootstrap credentials
-are added to the child environment. If the configured executable is a script,
-its single absolute native interpreter must also be SHA-256 pinned. Each binary
-is limited to 256 MiB, and copying plus hashing obeys the cumulative fetch
-deadline.
+The verified bytes are copied into a mode-0700 private temporary directory and
+opened through a mode-0500 regular file. Every invocation executes the retained,
+read-only descriptor through procfs, including after bootstrap credentials are
+added to the child environment. Keeping the verified file named allows native
+executables such as the official `bw` package to resolve and reopen
+`/proc/self/exe`. The private staging directory and retained descriptors are
+removed after every successful fetch; a persistent cleanup failure clears any
+resolved secrets and fails the fetch closed. If the configured executable is a
+script, its single absolute native interpreter must also be SHA-256 pinned and
+privately staged.
+Each binary is limited to 256 MiB, and copying plus hashing obeys the cumulative
+fetch deadline.
+
+The private directory protects staging from other operating-system users and
+the retained descriptor prevents a later replacement of the configured source
+path from changing the executed inode. A process already running as the Hermes
+service user is outside this boundary: it can inspect the same process
+environment and therefore already has access to the bootstrap credentials.
 This release targets Linux/POSIX service environments so it can isolate each CLI
 invocation in a process group and terminate inherited descendants on failure.
 
@@ -52,7 +64,7 @@ membership in `collection_id`. `binary_path` must identify an executable regular
 file directly; PATH lookup and symbolic links are rejected. `binary_sha256` must
 match that file, while the executable must also report version `2026.8.0`.
 Script interpreters are resolved to their canonical absolute path, copied into a
-separate sealed in-memory file and checked against `binary_interpreter_sha256`.
+separate private staged file and checked against `binary_interpreter_sha256`.
 
 Supported field selectors are `login.username`, `login.password`, `notes`, and
 `fields.<custom-field-name>`. Empty values fail the entire fetch and never

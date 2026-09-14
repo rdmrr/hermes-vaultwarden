@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import fcntl
 import hashlib
 import hmac
 import json
@@ -44,8 +43,6 @@ _MAX_EXECUTABLE_BYTES = 256 * 1_048_576
 _DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 _MIN_FETCH_TIMEOUT_SECONDS = 3.0
 _FETCH_CLEANUP_RESERVE_SECONDS = 2.5
-_F_ADD_SEALS = 1033
-_F_SEAL_ALL = 0x000F
 
 
 @dataclass(frozen=True)
@@ -59,6 +56,7 @@ class _PinnedExecutable:
     binary_path: Path
     binary_fd: int
     binary_sha256: str
+    stage_dir: tempfile.TemporaryDirectory
     interpreter_path: Path | None = None
     interpreter_fd: int | None = None
     interpreter_sha256: str | None = None
@@ -83,13 +81,32 @@ class _PinnedExecutable:
             (self.binary_fd, self.interpreter_fd),
         )
 
-    def close(self) -> None:
+    def close(self) -> bool:
         for fd in (self.binary_fd, self.interpreter_fd):
             if fd is not None:
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
+                _close_fd(fd)
+        return _cleanup_stage_dir(self.stage_dir)
+
+
+def _close_fd(fd: int | None) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _cleanup_stage_dir(stage_dir: tempfile.TemporaryDirectory) -> bool:
+    for _attempt in range(2):
+        try:
+            stage_dir.cleanup()
+            return True
+        except OSError:
+            continue
+        except Exception:  # noqa: BLE001 - cleanup must not escape the source contract
+            return False
+    return False
 
 
 def _canonical_uuid(value: object) -> str | None:
@@ -198,10 +215,17 @@ def _verify_fd(fd: int, expected_sha256: str, label: str, deadline: float) -> No
         raise _BwFailure(f"The pinned {label} digest does not match configuration.", ErrorKind.BINARY_MISSING)
 
 
-def _open_verified_fd(path: Path, expected_sha256: str, label: str, deadline: float) -> int:
+def _open_verified_fd(
+    path: Path,
+    staged_path: Path,
+    expected_sha256: str,
+    label: str,
+    deadline: float,
+) -> int:
     flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
     source_fd = None
-    pinned_fd = None
+    writer_fd = None
+    readonly_fd = None
     try:
         source_fd = os.open(path, flags)
         file_stat = os.fstat(source_fd)
@@ -209,9 +233,10 @@ def _open_verified_fd(path: Path, expected_sha256: str, label: str, deadline: fl
             raise OSError("not an executable regular file")
         if file_stat.st_size > _MAX_EXECUTABLE_BYTES:
             raise _BwFailure(f"The pinned {label} exceeds the executable size limit.", ErrorKind.BINARY_MISSING)
-        pinned_fd = os.memfd_create(
-            "hermes-vaultwarden-executable",
-            os.MFD_CLOEXEC | os.MFD_ALLOW_SEALING,
+        writer_fd = os.open(
+            staged_path,
+            os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_CREAT | os.O_EXCL,
+            0o500,
         )
         offset = 0
         while True:
@@ -222,34 +247,57 @@ def _open_verified_fd(path: Path, expected_sha256: str, label: str, deadline: fl
             written = 0
             while written < len(chunk):
                 _check_deadline(deadline)
-                written += os.write(pinned_fd, chunk[written:])
+                written += os.write(writer_fd, chunk[written:])
             offset += len(chunk)
             if offset > _MAX_EXECUTABLE_BYTES:
                 raise _BwFailure(f"The pinned {label} exceeds the executable size limit.", ErrorKind.BINARY_MISSING)
-        os.fchmod(pinned_fd, 0o500)
-        fcntl.fcntl(pinned_fd, _F_ADD_SEALS, _F_SEAL_ALL)
-        _verify_fd(pinned_fd, expected_sha256, label, deadline)
-        return pinned_fd
+        os.fchmod(writer_fd, 0o500)
+        _verify_fd(writer_fd, expected_sha256, label, deadline)
+        readonly_fd = os.open(staged_path, flags)
+        readonly_stat = os.fstat(readonly_fd)
+        pinned_stat = os.fstat(writer_fd)
+        if (readonly_stat.st_dev, readonly_stat.st_ino) != (pinned_stat.st_dev, pinned_stat.st_ino):
+            raise OSError("staged executable identity changed")
+        os.close(writer_fd)
+        writer_fd = None
+        result_fd = readonly_fd
+        readonly_fd = None
+        return result_fd
     except _BwFailure:
-        if pinned_fd is not None:
-            os.close(pinned_fd)
         raise
     except OSError as exc:
-        if pinned_fd is not None:
-            os.close(pinned_fd)
         raise _BwFailure(f"The pinned {label} could not be opened safely.", ErrorKind.BINARY_MISSING) from exc
     finally:
-        if source_fd is not None:
-            os.close(source_fd)
+        _close_fd(source_fd)
+        _close_fd(writer_fd)
+        _close_fd(readonly_fd)
 
 
 def _open_pinned_executable(binary: Path, cfg: dict, deadline: float) -> _PinnedExecutable:
     binary_sha256 = str(cfg["binary_sha256"])
-    binary_fd = _open_verified_fd(binary, binary_sha256, "bw executable", deadline)
+    stage_dir = tempfile.TemporaryDirectory(
+        prefix="hermes-vaultwarden-executable-",
+        dir="/tmp",
+    )
+    stage_root = Path(stage_dir.name)
+    binary_path = stage_root / "bw"
+    binary_fd = None
+    interpreter_fd = None
+    opened = False
     try:
+        os.chmod(stage_root, 0o700)
+        binary_fd = _open_verified_fd(
+            binary,
+            binary_path,
+            binary_sha256,
+            "bw executable",
+            deadline,
+        )
         header = os.pread(binary_fd, 512, 0)
         if header.startswith(b"\x7fELF"):
-            return _PinnedExecutable(binary, binary_fd, binary_sha256)
+            executable = _PinnedExecutable(binary_path, binary_fd, binary_sha256, stage_dir)
+            opened = True
+            return executable
         if not header.startswith(b"#!"):
             raise _BwFailure("The pinned bw executable format is unsupported.", ErrorKind.BINARY_MISSING)
         try:
@@ -265,26 +313,32 @@ def _open_pinned_executable(binary: Path, cfg: dict, deadline: float) -> _Pinned
             interpreter_path = Path(shebang[0]).resolve(strict=True)
         except OSError as exc:
             raise _BwFailure("The pinned bw script interpreter could not be resolved.", ErrorKind.BINARY_MISSING) from exc
+        staged_interpreter_path = stage_root / "interpreter"
         interpreter_fd = _open_verified_fd(
             interpreter_path,
+            staged_interpreter_path,
             interpreter_sha256,
             "bw script interpreter",
             deadline,
         )
         if not os.pread(interpreter_fd, 4, 0).startswith(b"\x7fELF"):
-            os.close(interpreter_fd)
             raise _BwFailure("The pinned bw script interpreter must be a native executable.", ErrorKind.BINARY_MISSING)
-        return _PinnedExecutable(
-            binary,
+        executable = _PinnedExecutable(
+            binary_path,
             binary_fd,
             binary_sha256,
-            interpreter_path,
+            stage_dir,
+            staged_interpreter_path,
             interpreter_fd,
             interpreter_sha256,
         )
-    except Exception:
-        os.close(binary_fd)
-        raise
+        opened = True
+        return executable
+    finally:
+        if not opened:
+            _close_fd(binary_fd)
+            _close_fd(interpreter_fd)
+            _cleanup_stage_dir(stage_dir)
 
 
 def _remaining_timeout(deadline: float, cli_timeout: float) -> float:
@@ -619,15 +673,15 @@ class VaultwardenSource(SecretSource):
                     deadline=deadline,
                 )
 
-            version_proc = run(["--version"], child_env)
-            if (version_proc.stdout or "").strip() != _BW_CLI_VERSION:
-                return result.fail(
-                    f"Bitwarden CLI {_BW_CLI_VERSION} is required by this plugin release.",
-                    ErrorKind.BINARY_MISSING,
-                )
-            child_env.update({target: source_env[source] for target, source in credential_vars.items()})
             with tempfile.TemporaryDirectory(prefix="hermes-vaultwarden-") as state_dir:
                 child_env["BITWARDENCLI_APPDATA_DIR"] = state_dir
+                version_proc = run(["--version"], child_env)
+                if (version_proc.stdout or "").strip() != _BW_CLI_VERSION:
+                    return result.fail(
+                        f"Bitwarden CLI {_BW_CLI_VERSION} is required by this plugin release.",
+                        ErrorKind.BINARY_MISSING,
+                    )
+                child_env.update({target: source_env[source] for target, source in credential_vars.items()})
                 run(["config", "server", str(cfg["server_url"])], child_env)
                 run(["login", "--apikey"], child_env)
                 unlocked = run(
@@ -673,8 +727,9 @@ class VaultwardenSource(SecretSource):
         except Exception as exc:  # noqa: BLE001 - the SecretSource contract forbids propagation
             return result.fail(f"Vaultwarden fetch failed safely ({type(exc).__name__}).", ErrorKind.INTERNAL)
         finally:
-            if executable is not None:
-                executable.close()
+            if executable is not None and not executable.close():
+                result.secrets.clear()
+                result.fail("Vaultwarden executable cleanup failed safely.", ErrorKind.INTERNAL)
 
 
 def register(ctx) -> None:
