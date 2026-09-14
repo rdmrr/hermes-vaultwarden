@@ -1,0 +1,21 @@
+name: Repository safety
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  safety:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - name: Unit tests
+        run: python3 -m unittest discover -s tests -v
+      - name: Repository safety scan
+        run: python3 scripts/check_repository_safety.py
+      - name: Whitespace validation
+        run: git diff --check HEAD^
