@@ -1,0 +1,63 @@
+# Runtime secrets and local overrides
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.local
+config/local.*
+
+# Credentials, key material, encrypted bootstrap files
+*.pem
+*.key
+*.p12
+*.pfx
+*.cred
+*.credentials
+credentials/
+secrets/
+auth.json
+hosts.yml
+hosts.yaml
+.git-credentials
+
+# Vaultwarden / Bitwarden client state and exports
+.bw/
+bw-data/
+vault.json
+vault-export*
+*.vault-export
+
+# Runtime and diagnostics
+*.log
+*.log.*
+*.dump
+*.trace
+*.pid
+*.sock
+coverage.xml
+.coverage
+htmlcov/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+# Build and virtual environments
+.venv/
+venv/
+build/
+dist/
+*.egg-info/
+
+# Local infrastructure artifacts
+local/
+tmp/
+artifacts/private/
+*.runtime.yaml
+*.runtime.yml
+
+# Editors and operating systems
+.DS_Store
+.idea/
+.vscode/
+*~
