@@ -17,9 +17,9 @@ Deploy `vaultwarden_secret_source/` unchanged as a directory below
 `${HERMES_HOME}/plugins/`. It implements Hermes Secret Source API v1 and uses
 the externally managed Bitwarden CLI pinned for this release to version
 `2026.8.0` and to operator-supplied SHA-256 digests for its executable and any
-script interpreter. Verified bytes execute from sealed in-memory files. The
-plugin never installs a binary, persists a session key, or writes to the process
-environment directly.
+script interpreter. Verified bytes execute from retained read-only descriptors
+backed by a private temporary staging directory. The plugin never installs a
+binary, persists a session key, or writes to the process environment directly.
 
 Configuration, allowlist semantics, supported fields, bootstrap variables and
 failure behavior are documented in [docs/configuration.md](docs/configuration.md).
