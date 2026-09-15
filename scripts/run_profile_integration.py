@@ -116,25 +116,29 @@ def _write_profile_config(home: Path, cfg: dict) -> None:
     binary = cfg["binary_path"]
     home.joinpath("config.yaml").write_text(
         "plugins:\n"
-        "  enabled: [vaultwarden-secret-source]\n"
+        "  enabled: [hermes-vaultwarden]\n"
+        "  entries:\n"
+        "    hermes-vaultwarden:\n"
+        "      settings:\n"
+        "        enabled: true\n"
+        "        server_url: https://vault.example.invalid\n"
+        f"        collection_id: {_COLLECTION_ID}\n"
+        "        allowed_item_ids:\n"
+        f"          - {_ITEM_ID}\n"
+        "        env:\n"
+        f"          {_TARGET_ENV}:\n"
+        f"            item_id: {_ITEM_ID}\n"
+        "            field: login.password\n"
+        f"        binary_path: {binary}\n"
+        f"        binary_sha256: {cfg['binary_sha256']}\n"
+        f"        binary_interpreter_sha256: {cfg['binary_interpreter_sha256']}\n"
+        "        cli_timeout_seconds: 5\n"
+        "        timeout_seconds: 15\n"
+        "        override_existing: true\n"
         "secrets:\n"
         "  sources: [vaultwarden]\n"
         "  vaultwarden:\n"
-        "    enabled: true\n"
-        "    server_url: https://vault.example.invalid\n"
-        f"    collection_id: {_COLLECTION_ID}\n"
-        "    allowed_item_ids:\n"
-        f"      - {_ITEM_ID}\n"
-        "    env:\n"
-        f"      {_TARGET_ENV}:\n"
-        f"        item_id: {_ITEM_ID}\n"
-        "        field: login.password\n"
-        f"    binary_path: {binary}\n"
-        f"    binary_sha256: {cfg['binary_sha256']}\n"
-        f"    binary_interpreter_sha256: {cfg['binary_interpreter_sha256']}\n"
-        "    cli_timeout_seconds: 5\n"
-        "    timeout_seconds: 15\n"
-        "    override_existing: true\n",
+        "    enabled: true\n",
         encoding="utf-8",
     )
 
@@ -198,7 +202,7 @@ def _run_profile_integration_worker(project_root: Path) -> dict:
     with tempfile.TemporaryDirectory(prefix="hermes-vaultwarden-profile-") as tmp:
         root = Path(tmp)
         home = root / "profiles" / "portable-test"
-        plugin_target = home / "plugins" / "vaultwarden-secret-source"
+        plugin_target = home / "plugins" / "hermes-vaultwarden"
         plugin_target.parent.mkdir(parents=True)
         shutil.copytree(project_root / "vaultwarden_secret_source", plugin_target)
 
