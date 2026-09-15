@@ -10,11 +10,25 @@ permissions:
 jobs:
   safety:
     runs-on: ubuntu-latest
+    env:
+      HERMES_AGENT_SRC: ${{ github.workspace }}/.hermes-fixture
+      PYTHONPATH: ${{ github.workspace }}:${{ github.workspace }}/.hermes-fixture
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
+      - name: Checkout pinned Hermes fixture
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: NousResearch/hermes-agent
+          ref: fef0bc56b2f622ffe124835fbf57adfd10aa17e6
+          path: .hermes-fixture
+          persist-credentials: false
+      - name: Install Hermes fixture dependencies
+        run: python3 -m pip install --editable "$HERMES_AGENT_SRC"
+      - name: Validate Hermes fixture
+        run: python3 scripts/check_hermes_fixture.py
       - name: Unit tests
         run: python3 -m unittest discover -s tests -v
       - name: Repository safety scan

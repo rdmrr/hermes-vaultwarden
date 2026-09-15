@@ -8,9 +8,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from scripts.check_hermes_fixture import require_hermes_fixture
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNNER = PROJECT_ROOT / "scripts" / "run_profile_integration.py"
+
+
+def setUpModule() -> None:
+    require_hermes_fixture()
 
 
 class PortableProfileIntegrationTests(unittest.TestCase):
