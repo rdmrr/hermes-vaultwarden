@@ -67,7 +67,7 @@ def _write_bootstrap_env(home: Path) -> None:
 
 def _prepare_profile(project_root: Path, root: Path, name: str, value: str) -> Path:
     home = root / "profiles" / name
-    plugin_target = home / "plugins" / "vaultwarden-secret-source"
+    plugin_target = home / "plugins" / "hermes-vaultwarden"
     plugin_target.parent.mkdir(parents=True)
     shutil.copytree(project_root / "vaultwarden_secret_source", plugin_target)
 

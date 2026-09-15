@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import hmac
 import json
@@ -43,6 +44,22 @@ _MAX_EXECUTABLE_BYTES = 256 * 1_048_576
 _DEFAULT_FETCH_TIMEOUT_SECONDS = 120.0
 _MIN_FETCH_TIMEOUT_SECONDS = 3.0
 _FETCH_CLEANUP_RESERVE_SECONDS = 2.5
+_PLUGIN_SETTING_DEFAULTS = {
+    "enabled": False,
+    "server_url": "",
+    "collection_id": "",
+    "allowed_item_ids": [],
+    "env": {},
+    "client_id_env": "BW_CLIENTID",
+    "client_secret_env": "BW_CLIENTSECRET",
+    "master_password_env": "BW_PASSWORD",
+    "binary_path": "",
+    "binary_sha256": "",
+    "binary_interpreter_sha256": "",
+    "cli_timeout_seconds": 30,
+    "timeout_seconds": 120,
+    "override_existing": True,
+}
 
 
 @dataclass(frozen=True)
@@ -540,12 +557,23 @@ class VaultwardenSource(SecretSource):
     default_token_env = "BW_CLIENTSECRET"
     override_existing_default = True
 
+    def __init__(self, settings: dict | None = None):
+        self._settings = dict(settings) if isinstance(settings, dict) else None
+
+    def _effective_config(self, cfg: dict | None) -> dict:
+        if self._settings is not None:
+            return dict(self._settings)
+        return dict(cfg) if isinstance(cfg, dict) else {}
+
     def is_enabled(self, cfg: dict) -> bool:
-        return isinstance(cfg, dict) and cfg.get("enabled") is True
+        return (
+            isinstance(cfg, dict)
+            and cfg.get("enabled") is True
+            and self._effective_config(cfg).get("enabled") is True
+        )
 
     def override_existing(self, cfg: dict) -> bool:
-        if not isinstance(cfg, dict):
-            return False
+        cfg = self._effective_config(cfg)
         return cfg.get("override_existing", self.override_existing_default) is True
 
     def config_schema(self) -> dict:
@@ -597,7 +625,7 @@ class VaultwardenSource(SecretSource):
         }
 
     def protected_env_vars(self, cfg: dict) -> frozenset[str]:
-        cfg = cfg if isinstance(cfg, dict) else {}
+        cfg = self._effective_config(cfg)
         protected = {"BW_CLIENTID", "BW_CLIENTSECRET", "BW_PASSWORD"}
         configured = {
             str(cfg.get("client_id_env") or ""),
@@ -608,14 +636,15 @@ class VaultwardenSource(SecretSource):
         return frozenset(protected)
 
     def fetch_timeout_seconds(self, cfg: dict) -> float:
+        cfg = self._effective_config(cfg)
         configured = _positive_timeout(
-            (cfg or {}).get("timeout_seconds") if isinstance(cfg, dict) else None,
+            cfg.get("timeout_seconds"),
             _DEFAULT_FETCH_TIMEOUT_SECONDS,
         )
         return max(configured, _MIN_FETCH_TIMEOUT_SECONDS)
 
     def fetch(self, cfg: dict, home_path: Path) -> FetchResult:
-        cfg = cfg if isinstance(cfg, dict) else {}
+        cfg = self._effective_config(cfg)
         result = FetchResult()
         fetch_timeout = self.fetch_timeout_seconds(cfg)
         deadline = time.monotonic() + fetch_timeout - _FETCH_CLEANUP_RESERVE_SECONDS
@@ -732,7 +761,336 @@ class VaultwardenSource(SecretSource):
                 result.fail("Vaultwarden executable cleanup failed safely.", ErrorKind.INTERNAL)
 
 
+def register_vaultwarden_cli(subparser: argparse.ArgumentParser) -> None:
+    actions = subparser.add_subparsers(dest="vaultwarden_action", required=True)
+    lookup = actions.add_parser("lookup", help="Find item UUIDs without printing secret values")
+    lookup.add_argument("query", help="Item name search text")
+    lookup.add_argument("--collection", default="", help="Collection name search text")
+    actions.add_parser("status", help="Show safe configuration status")
+    actions.add_parser("doctor", help="Validate configuration and prerequisites")
+    actions.add_parser("config", help="Show safe hermes config set examples")
+
+
+def _doctor(settings: dict) -> tuple[dict, int]:
+    issues: list[str] = []
+    bw_version = None
+    deadline = time.monotonic() + _positive_timeout(settings.get("cli_timeout_seconds"))
+    try:
+        _bindings, error, _kind = _validate_config(settings, deadline)
+        if error:
+            issues.append(error.replace("secrets.vaultwarden", "plugin settings"))
+    except _BwFailure as exc:
+        issues.append(str(exc))
+
+    source_env = get_source_environment()
+    credential_names = [
+        str(settings.get("client_id_env") or "BW_CLIENTID"),
+        str(settings.get("client_secret_env") or "BW_CLIENTSECRET"),
+        str(settings.get("master_password_env") or "BW_PASSWORD"),
+    ]
+    for name in credential_names:
+        if not is_valid_env_name(name):
+            issues.append("A bootstrap environment name is invalid.")
+        elif not source_env.get(name, "").strip():
+            issues.append(f"Bootstrap environment variable {name} is unavailable.")
+
+    configured_binary = str(settings.get("binary_path") or "").strip()
+    binary = Path(configured_binary)
+    if not configured_binary or not binary.is_absolute():
+        issues.append("plugin settings.binary_path must be an absolute file path.")
+    elif not issues:
+        executable = None
+        try:
+            executable = _open_pinned_executable(binary, settings, deadline)
+            with tempfile.TemporaryDirectory(prefix="hermes-vaultwarden-doctor-") as state_dir:
+                proc = _run_pinned_bw(
+                    executable,
+                    ["--version"],
+                    env={"NO_COLOR": "1", "BITWARDENCLI_APPDATA_DIR": state_dir},
+                    cli_timeout=_positive_timeout(settings.get("cli_timeout_seconds")),
+                    deadline=deadline,
+                )
+            if (proc.stdout or "").strip() == _BW_CLI_VERSION:
+                bw_version = _BW_CLI_VERSION
+            else:
+                issues.append(f"Bitwarden CLI {_BW_CLI_VERSION} is required.")
+        except _BwFailure as exc:
+            issues.append(str(exc))
+        except Exception as exc:  # noqa: BLE001 - doctor must remain diagnostic
+            issues.append(f"Local prerequisite check failed safely ({type(exc).__name__}).")
+        finally:
+            if executable is not None and not executable.close():
+                issues.append("Vaultwarden executable cleanup failed safely.")
+
+    report = {
+        "ok": not issues,
+        "issues": issues,
+        "bw_version": bw_version,
+        "remote_access_attempted": False,
+    }
+    return report, 0 if not issues else 1
+
+
+def _safe_metadata_text(value: object, limit: int = 200) -> str:
+    if not isinstance(value, str):
+        return ""
+    return "".join(character for character in value if character.isprintable())[:limit]
+
+
+def _json_list(raw: str, label: str) -> list:
+    try:
+        payload = json.loads(raw or "")
+    except json.JSONDecodeError as exc:
+        raise _BwFailure(f"bw {label} returned invalid JSON.", ErrorKind.INTERNAL) from exc
+    if not isinstance(payload, list):
+        raise _BwFailure(f"bw {label} returned an unexpected result.", ErrorKind.INTERNAL)
+    return payload
+
+
+def _available_fields(item: dict) -> list[str]:
+    fields: list[str] = []
+    login = item.get("login")
+    if isinstance(login, dict):
+        for name in ("password", "username"):
+            if isinstance(login.get(name), str) and login[name].strip():
+                fields.append(f"login.{name}")
+    if isinstance(item.get("notes"), str) and item["notes"].strip():
+        fields.append("notes")
+    custom_fields = item.get("fields")
+    if isinstance(custom_fields, list):
+        for candidate in custom_fields:
+            if not isinstance(candidate, dict):
+                continue
+            name = _safe_metadata_text(candidate.get("name"))
+            if name and isinstance(candidate.get("value"), str) and candidate["value"].strip():
+                fields.append(f"fields.{name}")
+    return sorted(set(fields))
+
+
+def _lookup(settings: dict, query: str, collection_query: str) -> tuple[dict, int]:
+    query = query.strip()
+    collection_query = collection_query.strip()
+    if not query:
+        return {"ok": False, "error": "A non-empty item search query is required."}, 2
+    server_url = settings.get("server_url")
+    try:
+        parsed_url = urlparse(server_url) if isinstance(server_url, str) else None
+    except ValueError:
+        parsed_url = None
+    if (
+        not parsed_url
+        or parsed_url.scheme != "https"
+        or not parsed_url.hostname
+        or parsed_url.username
+        or parsed_url.password
+        or parsed_url.query
+        or parsed_url.fragment
+    ):
+        return {"ok": False, "error": "Plugin server_url must be an HTTPS URL without credentials, query, or fragment."}, 1
+
+    source_env = get_source_environment()
+    credential_vars = {
+        "BW_CLIENTID": str(settings.get("client_id_env") or "BW_CLIENTID"),
+        "BW_CLIENTSECRET": str(settings.get("client_secret_env") or "BW_CLIENTSECRET"),
+        "BW_PASSWORD": str(settings.get("master_password_env") or "BW_PASSWORD"),
+    }
+    if any(not is_valid_env_name(name) for name in credential_vars.values()):
+        return {"ok": False, "error": "Bootstrap environment names are invalid."}, 1
+    if any(not source_env.get(name, "").strip() for name in credential_vars.values()):
+        return {"ok": False, "error": "Bootstrap credentials are unavailable."}, 1
+
+    configured_binary = str(settings.get("binary_path") or "").strip()
+    binary = Path(configured_binary)
+    if not configured_binary or not binary.is_absolute():
+        return {"ok": False, "error": "Plugin binary_path must be absolute."}, 1
+    cli_timeout = _positive_timeout(settings.get("cli_timeout_seconds"))
+    deadline = time.monotonic() + max(cli_timeout * 8, _MIN_FETCH_TIMEOUT_SECONDS)
+    executable = None
+    result: tuple[dict, int]
+    try:
+        executable = _open_pinned_executable(binary, settings, deadline)
+
+        def run(command: list[str], env: dict[str, str]):
+            return _run_pinned_bw(
+                executable,
+                command,
+                env=env,
+                cli_timeout=cli_timeout,
+                deadline=deadline,
+            )
+
+        with tempfile.TemporaryDirectory(prefix="hermes-vaultwarden-lookup-") as state_dir:
+            child_env = {name: source_env[name] for name in _BASE_CHILD_ENV if name in source_env}
+            child_env.update({"NO_COLOR": "1", "BITWARDENCLI_APPDATA_DIR": state_dir})
+            version = run(["--version"], child_env)
+            if (version.stdout or "").strip() != _BW_CLI_VERSION:
+                raise _BwFailure(f"Bitwarden CLI {_BW_CLI_VERSION} is required.", ErrorKind.BINARY_MISSING)
+            child_env.update({target: source_env[source] for target, source in credential_vars.items()})
+            run(["config", "server", str(server_url)], child_env)
+            run(["login", "--apikey"], child_env)
+            unlocked = run(["unlock", "--passwordenv", "BW_PASSWORD", "--raw"], child_env)
+            session = (unlocked.stdout or "").strip()
+            if not session:
+                raise _BwFailure("bw unlock returned an empty session key.", ErrorKind.AUTH_FAILED)
+            child_env["BW_SESSION"] = session
+            run(["sync"], child_env)
+
+            collections = []
+            collection_id = None
+            if collection_query:
+                raw_collections = _json_list(
+                    run(["list", "collections", "--search", collection_query], child_env).stdout,
+                    "list collections",
+                )
+                for candidate in raw_collections:
+                    if not isinstance(candidate, dict):
+                        continue
+                    candidate_id = _canonical_uuid(candidate.get("id"))
+                    if candidate_id:
+                        collections.append({
+                            "id": candidate_id,
+                            "name": _safe_metadata_text(candidate.get("name")),
+                        })
+                if len(collections) != 1:
+                    result = ({
+                        "ok": False,
+                        "error": "Collection search must resolve to exactly one UUID.",
+                        "collections": collections,
+                        "items": [],
+                    }, 1)
+                    return result
+                collection_id = collections[0]["id"]
+
+            command = ["list", "items", "--search", query]
+            if collection_id:
+                command.extend(["--collectionid", collection_id])
+            raw_items = _json_list(run(command, child_env).stdout, "list items")
+            items = []
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                item_id = _canonical_uuid(item.get("id"))
+                if item_id is None:
+                    continue
+                collection_ids = [
+                    canonical
+                    for raw_id in item.get("collectionIds", [])
+                    if (canonical := _canonical_uuid(raw_id)) is not None
+                ] if isinstance(item.get("collectionIds"), list) else []
+                items.append({
+                    "id": item_id,
+                    "name": _safe_metadata_text(item.get("name")),
+                    "type": item.get("type") if isinstance(item.get("type"), int) else None,
+                    "collection_ids": collection_ids,
+                    "available_fields": _available_fields(item),
+                })
+            result = ({"ok": True, "collections": collections, "items": items}, 0)
+    except _BwFailure as exc:
+        result = ({"ok": False, "error": str(exc), "error_kind": exc.kind.value}, 1)
+    except Exception as exc:  # noqa: BLE001 - CLI diagnostics must never expose raw output
+        result = ({"ok": False, "error": f"Lookup failed safely ({type(exc).__name__})."}, 1)
+    finally:
+        if executable is not None and not executable.close():
+            result = ({"ok": False, "error": "Vaultwarden executable cleanup failed safely."}, 1)
+    return result
+
+
+def vaultwarden_command(args: argparse.Namespace, settings: dict) -> int:
+    action = getattr(args, "vaultwarden_action", "")
+    if action == "status":
+        source_env = get_source_environment()
+        bootstrap_names = [
+            str(settings.get("client_id_env") or "BW_CLIENTID"),
+            str(settings.get("client_secret_env") or "BW_CLIENTSECRET"),
+            str(settings.get("master_password_env") or "BW_PASSWORD"),
+        ]
+        raw_bindings = settings.get("env")
+        bindings = {}
+        if isinstance(raw_bindings, dict):
+            for env_name, raw_binding in raw_bindings.items():
+                if not isinstance(env_name, str) or not is_valid_env_name(env_name):
+                    continue
+                if not isinstance(raw_binding, dict):
+                    continue
+                item_id = _canonical_uuid(raw_binding.get("item_id"))
+                field = raw_binding.get("field")
+                if item_id is None or not isinstance(field, str):
+                    continue
+                field = field.strip()
+                if field not in {"login.username", "login.password", "notes"} and not (
+                    field.startswith("fields.") and field != "fields."
+                ):
+                    continue
+                bindings[env_name] = {"item_id": item_id, "field": field}
+        collection_id = _canonical_uuid(settings.get("collection_id"))
+        raw_allowed_item_ids = settings.get("allowed_item_ids")
+        allowed_item_ids = []
+        if isinstance(raw_allowed_item_ids, list):
+            allowed_item_ids = sorted({
+                item_id
+                for raw_item_id in raw_allowed_item_ids
+                if (item_id := _canonical_uuid(raw_item_id)) is not None
+            })
+        print(json.dumps({
+            "enabled": settings.get("enabled") is True,
+            "server_url_configured": bool(str(settings.get("server_url") or "").strip()),
+            "collection_id": collection_id,
+            "allowed_item_ids": allowed_item_ids,
+            "bindings": bindings,
+            "bootstrap_environment": {
+                name: bool(source_env.get(name, "").strip())
+                for name in bootstrap_names if is_valid_env_name(name)
+            },
+            "binary_path_configured": bool(str(settings.get("binary_path") or "").strip()),
+            "binary_sha256_configured": bool(settings.get("binary_sha256")),
+        }, indent=2, sort_keys=True))
+        return 0
+    if action == "config":
+        prefix = "plugins.entries.hermes-vaultwarden.settings"
+        item_id = "00000000-0000-4000-8000-000000000002"
+        print("Configure non-secret settings with Hermes' supported config writer:")
+        print(f"hermes config set {prefix}.server_url https://vault.example.invalid")
+        print(f"hermes config set {prefix}.collection_id 00000000-0000-4000-8000-000000000001")
+        print(f"hermes config set {prefix}.allowed_item_ids '[\"{item_id}\"]'")
+        print(
+            f"hermes config set {prefix}.env "
+            f"'{{\"SYNTHETIC_API_KEY\":{{\"item_id\":\"{item_id}\","
+            "\"field\":\"login.password\"}}}'"
+        )
+        print(f"hermes config set {prefix}.binary_path /opt/example/bin/bw")
+        print(f"hermes config set {prefix}.binary_sha256 '<64-lowercase-hex-characters>'")
+        print(f"hermes config set {prefix}.enabled true")
+        print("hermes config set secrets.sources '[\"vaultwarden\"]'")
+        print("hermes config set secrets.vaultwarden.enabled true")
+        print("Bootstrap credential values do not belong in config.yaml.")
+        return 0
+    if action == "doctor":
+        report, exit_code = _doctor(settings)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return exit_code
+    if action == "lookup":
+        report, exit_code = _lookup(
+            settings,
+            str(getattr(args, "query", "") or ""),
+            str(getattr(args, "collection", "") or ""),
+        )
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return exit_code
+    return 2
+
+
 def register(ctx) -> None:
     """Register the source without import-time side effects."""
 
-    ctx.register_secret_source(VaultwardenSource())
+    settings = {
+        key: ctx.get_config(key, default)
+        for key, default in _PLUGIN_SETTING_DEFAULTS.items()
+    }
+    ctx.register_secret_source(VaultwardenSource(settings))
+    ctx.register_cli_command(
+        name="vaultwarden",
+        help="Inspect and configure the Hermes Vaultwarden secret source",
+        setup_fn=register_vaultwarden_cli,
+        handler_fn=lambda args: vaultwarden_command(args, settings),
+        description="Safe UUID lookup, status, doctor, and configuration help.",
+    )
