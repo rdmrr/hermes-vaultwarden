@@ -8,12 +8,22 @@ the repository checkout. The profile exercise runs in an isolated subprocess,
 so it cannot clear or overwrite the caller's environment, plugin registry or
 secret-source cache.
 
-Run it from the repository root with a Python environment that can import the
-Hermes Agent packages:
+The tests require an explicit source fixture; they fail instead of skipping when
+it is absent or resolves to another installation. Use a separate checkout of
+`NousResearch/hermes-agent` pinned to commit
+`fef0bc56b2f622ffe124835fbf57adfd10aa17e6`, install its dependencies in the
+test environment, and expose both source roots explicitly:
 
 ```bash
-python3 scripts/run_profile_integration.py
+export HERMES_AGENT_SRC=/path/to/pinned/hermes-agent
+export PYTHONPATH="${PWD}:${HERMES_AGENT_SRC}"
+python3 -m pip install --editable "${HERMES_AGENT_SRC}"
+python3 scripts/check_hermes_fixture.py
+python3 -m unittest discover -s tests -v
 ```
+
+GitHub Actions creates that checkout independently on every run. No pre-existing
+Hermes installation or developer checkout is used as CI evidence.
 
 The command exits successfully only when all of these phases produce their
 exact expected result:

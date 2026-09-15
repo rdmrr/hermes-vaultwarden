@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import os
 import shutil
 import tempfile
@@ -9,18 +8,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
-def _hermes_available() -> bool:
-    try:
-        return importlib.util.find_spec("agent.secret_sources.base") is not None
-    except (ImportError, ModuleNotFoundError):
-        return False
+from scripts.check_hermes_fixture import require_hermes_fixture
 
 
-HERMES_AVAILABLE = _hermes_available()
+def setUpModule() -> None:
+    require_hermes_fixture()
 
 
-@unittest.skipUnless(HERMES_AVAILABLE, "set PYTHONPATH to a compatible Hermes Agent checkout")
 class HermesContractIntegrationTests(unittest.TestCase):
     @staticmethod
     def _pin_fake_bw(cfg: dict, fake_bw: Path) -> None:
@@ -119,7 +113,7 @@ class HermesContractIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             home = root / "hermes-home"
-            plugin_target = home / "plugins" / "vaultwarden-secret-source"
+            plugin_target = home / "plugins" / "hermes-vaultwarden"
             plugin_target.parent.mkdir(parents=True)
             shutil.copytree(project_root / "vaultwarden_secret_source", plugin_target)
             fake_bw = self._write_fake_bw(root, collection_id)
@@ -128,22 +122,26 @@ class HermesContractIntegrationTests(unittest.TestCase):
             interpreter_sha256 = hashlib.sha256(interpreter.read_bytes()).hexdigest()
             (home / "config.yaml").write_text(
                 "plugins:\n"
-                "  enabled: [vaultwarden-secret-source]\n"
+                "  enabled: [hermes-vaultwarden]\n"
+                "  entries:\n"
+                "    hermes-vaultwarden:\n"
+                "      settings:\n"
+                "        enabled: true\n"
+                "        server_url: https://vault.example.invalid\n"
+                f"        collection_id: {collection_id}\n"
+                "        allowed_item_ids:\n"
+                f"          - {item_id}\n"
+                "        env:\n"
+                "          SYNTHETIC_PLUGIN_DISCOVERY:\n"
+                f"            item_id: {item_id}\n"
+                "            field: login.password\n"
+                f"        binary_path: {fake_bw}\n"
+                f"        binary_sha256: {fake_bw_sha256}\n"
+                f"        binary_interpreter_sha256: {interpreter_sha256}\n"
                 "secrets:\n"
                 "  sources: [vaultwarden]\n"
                 "  vaultwarden:\n"
-                "    enabled: true\n"
-                "    server_url: https://vault.example.invalid\n"
-                f"    collection_id: {collection_id}\n"
-                "    allowed_item_ids:\n"
-                f"      - {item_id}\n"
-                "    env:\n"
-                "      SYNTHETIC_PLUGIN_DISCOVERY:\n"
-                f"        item_id: {item_id}\n"
-                "        field: login.password\n"
-                f"    binary_path: {fake_bw}\n"
-                f"    binary_sha256: {fake_bw_sha256}\n"
-                f"    binary_interpreter_sha256: {interpreter_sha256}\n",
+                "    enabled: true\n",
                 encoding="utf-8",
             )
             runtime_env = {

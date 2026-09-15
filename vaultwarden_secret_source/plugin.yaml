@@ -1,7 +1,7 @@
 manifest_version: 2
 api_version: 1
-name: vaultwarden-secret-source
-version: "0.1.0"
+name: hermes-vaultwarden
+version: "0.2.0"
 description: "Allowlisted Vaultwarden secret source for Hermes Agent"
 kind: standalone
 platforms: [linux]
@@ -12,3 +12,18 @@ external_dependencies:
 tags:
   - secrets
   - vaultwarden
+config_schema:
+  enabled: {type: bool, default: false, description: "Enable the Vaultwarden secret source"}
+  server_url: {type: str, default: "", description: "Vaultwarden HTTPS URL"}
+  collection_id: {type: str, default: "", description: "Allowed collection UUID"}
+  allowed_item_ids: {type: list, default: [], description: "Explicit item UUID allowlist"}
+  env: {type: dict, default: {}, description: "ENV_VAR to UUID and field bindings"}
+  client_id_env: {type: str, default: "BW_CLIENTID", description: "Bootstrap client ID environment name"}
+  client_secret_env: {type: str, default: "BW_CLIENTSECRET", description: "Bootstrap client secret environment name"}
+  master_password_env: {type: str, default: "BW_PASSWORD", description: "Bootstrap master credential environment name"}
+  binary_path: {type: str, default: "", description: "Absolute path to the pinned bw binary"}
+  binary_sha256: {type: str, default: "", description: "Lowercase SHA-256 digest of the bw binary"}
+  binary_interpreter_sha256: {type: str, default: "", description: "Digest required when bw is a script"}
+  cli_timeout_seconds: {type: float, default: 30, description: "Per-command timeout"}
+  timeout_seconds: {type: float, default: 120, description: "Hermes fetch timeout"}
+  override_existing: {type: bool, default: true, description: "Allow resolved values to replace ambient values"}

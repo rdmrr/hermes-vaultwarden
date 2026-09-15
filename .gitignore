@@ -43,6 +43,7 @@ __pycache__/
 *.py[cod]
 
 # Build and virtual environments
+.test-fixture/
 .venv/
 venv/
 build/
