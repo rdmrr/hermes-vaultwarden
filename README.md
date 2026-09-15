@@ -25,6 +25,9 @@ Configuration, allowlist semantics, supported fields, bootstrap variables and
 failure behavior are documented in [docs/configuration.md](docs/configuration.md).
 The portable profile, rotation and fail-open integration procedure is documented
 in [docs/testing.md](docs/testing.md).
+The preview-first TPM2/systemd helper, its isolated per-profile paths and its
+rollback behavior are documented in
+[docs/systemd-bootstrap.md](docs/systemd-bootstrap.md).
 
 ## Security boundary
 
