@@ -1094,3 +1094,10 @@ def register(ctx) -> None:
         handler_fn=lambda args: vaultwarden_command(args, settings),
         description="Safe UUID lookup, status, doctor, and configuration help.",
     )
+    register_skill = getattr(ctx, "register_skill", None)
+    if callable(register_skill):
+        skill_path = Path(__file__).parent / "skills" / "vaultwarden-secrets"
+        try:
+            register_skill("vaultwarden-secrets", skill_path)
+        except Exception:  # noqa: BLE001 - skill bundling must never break plugin load
+            pass
