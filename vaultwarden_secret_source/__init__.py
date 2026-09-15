@@ -1055,7 +1055,7 @@ def vaultwarden_command(args: argparse.Namespace, settings: dict) -> int:
         print(
             f"hermes config set {prefix}.env "
             f"'{{\"SYNTHETIC_API_KEY\":{{\"item_id\":\"{item_id}\","
-            "\"field\":\"login.password\"}}}'"
+            "\"field\":\"login.password\"}}'"
         )
         print(f"hermes config set {prefix}.binary_path /opt/example/bin/bw")
         print(f"hermes config set {prefix}.binary_sha256 '<64-lowercase-hex-characters>'")
