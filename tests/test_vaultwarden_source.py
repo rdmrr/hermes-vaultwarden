@@ -4,6 +4,9 @@ import hashlib
 import importlib.util
 import os
 import re
+import argparse
+import contextlib
+import io
 import subprocess
 import sys
 import time
@@ -121,19 +124,260 @@ def _load_plugin():
 
 
 class RegistrationTests(unittest.TestCase):
+    def test_manifest_v2_declares_native_plugin_settings_schema(self):
+        manifest = MANIFEST_PATH.read_text(encoding="utf-8")
+
+        self.assertIn("name: hermes-vaultwarden", manifest)
+        self.assertIn("config_schema:", manifest)
+        for key, type_name in {
+            "enabled": "bool",
+            "server_url": "str",
+            "collection_id": "str",
+            "allowed_item_ids": "list",
+            "env": "dict",
+            "binary_path": "str",
+            "binary_sha256": "str",
+        }.items():
+            self.assertRegex(
+                manifest,
+                rf"(?m)^  {re.escape(key)}:.*type: {type_name}",
+            )
+
+    def test_register_uses_plugin_context_settings_and_registers_native_cli(self):
+        module = _load_plugin()
+        item_id = "00000000-0000-4000-8000-000000000002"
+        settings = {
+            "enabled": True,
+            "server_url": "https://vault.example.invalid",
+            "collection_id": "00000000-0000-4000-8000-000000000001",
+            "allowed_item_ids": [item_id],
+            "env": {"SYNTHETIC_API_KEY": {"item_id": item_id, "field": "login.password"}},
+        }
+        sources = []
+        commands = []
+        ctx = types.SimpleNamespace(
+            get_config=lambda key, default=None: settings.get(key, default),
+            register_secret_source=sources.append,
+            register_cli_command=lambda **kwargs: commands.append(kwargs),
+        )
+
+        module.register(ctx)
+
+        self.assertEqual(1, len(sources))
+        self.assertFalse(sources[0].is_enabled({}))
+        self.assertFalse(sources[0].is_enabled({"enabled": False}))
+        self.assertTrue(sources[0].is_enabled({"enabled": True}))
+        self.assertEqual("vaultwarden", sources[0].name)
+        self.assertEqual(["vaultwarden"], [command["name"] for command in commands])
+        parser = argparse.ArgumentParser()
+        commands[0]["setup_fn"](parser)
+        for action in ("lookup", "status", "doctor", "config"):
+            with self.subTest(action=action):
+                parsed = parser.parse_args([action, "synthetic"] if action == "lookup" else [action])
+                self.assertEqual(action, parsed.vaultwarden_action)
+
+    def test_status_prints_only_safe_configuration_metadata(self):
+        module = _load_plugin()
+        item_id = "00000000-0000-4000-8000-000000000002"
+        settings = {
+            "enabled": True,
+            "server_url": "https://vault.example.invalid",
+            "collection_id": "00000000-0000-4000-8000-000000000001",
+            "allowed_item_ids": [item_id],
+            "env": {"SYNTHETIC_API_KEY": {"item_id": item_id, "field": "login.password"}},
+            "client_secret_env": "BW_CLIENTSECRET",
+        }
+        args = argparse.Namespace(vaultwarden_action="status")
+
+        with mock.patch.dict(os.environ, {"BW_CLIENTSECRET": "must-not-leak"}, clear=True):
+            stdout = io.StringIO()
+            with contextlib.redirect_stdout(stdout):
+                result = module.vaultwarden_command(args, settings)
+
+        payload = __import__("json").loads(stdout.getvalue())
+        self.assertEqual(0, result)
+        self.assertEqual(item_id, payload["bindings"]["SYNTHETIC_API_KEY"]["item_id"])
+        self.assertTrue(payload["bootstrap_environment"]["BW_CLIENTSECRET"])
+        self.assertNotIn("must-not-leak", stdout.getvalue())
+
+    def test_status_drops_untrusted_binding_values_and_non_uuid_references(self):
+        module = _load_plugin()
+        settings = {
+            "collection_id": "not-a-uuid-must-not-leak-collection",
+            "allowed_item_ids": ["not-a-uuid-must-not-leak-item"],
+            "binary_path": "/must-not-leak/private/bw",
+            "env": {
+                "VALID_NAME": {
+                    "item_id": "not-a-uuid-must-not-leak",
+                    "field": "login.password",
+                    "value": "must-not-leak-secret",
+                },
+                "INVALID-NAME": "must-not-leak-scalar",
+            },
+        }
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            result = module.vaultwarden_command(
+                argparse.Namespace(vaultwarden_action="status"),
+                settings,
+            )
+
+        payload = __import__("json").loads(stdout.getvalue())
+        self.assertEqual(0, result)
+        self.assertEqual({}, payload["bindings"])
+        self.assertIsNone(payload["collection_id"])
+        self.assertEqual([], payload["allowed_item_ids"])
+        self.assertTrue(payload["binary_path_configured"])
+        self.assertNotIn("must-not-leak", stdout.getvalue())
+
+    def test_config_help_uses_only_plugin_settings_namespace(self):
+        module = _load_plugin()
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            result = module.vaultwarden_command(
+                argparse.Namespace(vaultwarden_action="config"),
+                {},
+            )
+
+        output = stdout.getvalue()
+        self.assertEqual(0, result)
+        self.assertIn("hermes config set plugins.entries.hermes-vaultwarden.settings.enabled true", output)
+        self.assertIn("plugins.entries.hermes-vaultwarden.settings.env", output)
+        self.assertIn("hermes config set secrets.vaultwarden.enabled true", output)
+        self.assertNotIn("secrets.vaultwarden.env", output)
+
+    def test_doctor_checks_pinned_binary_and_bootstrap_without_remote_access(self):
+        module = _load_plugin()
+        item_id = "00000000-0000-4000-8000-000000000002"
+        with TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "bw"
+            binary.write_text("#!/usr/bin/python3\nprint('2026.8.0')\n", encoding="utf-8")
+            binary.chmod(0o700)
+            settings = {
+                "enabled": True,
+                "server_url": "https://vault.example.invalid",
+                "collection_id": "00000000-0000-4000-8000-000000000001",
+                "allowed_item_ids": [item_id],
+                "env": {"SYNTHETIC_API_KEY": {"item_id": item_id, "field": "login.password"}},
+            }
+            _pin_binary(settings, binary)
+            env = {
+                "BW_CLIENTID": "synthetic-client",
+                "BW_CLIENTSECRET": "must-not-leak",
+                "BW_PASSWORD": "synthetic-master",
+            }
+            stdout = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True):
+                with contextlib.redirect_stdout(stdout):
+                    result = module.vaultwarden_command(
+                        argparse.Namespace(vaultwarden_action="doctor"),
+                        settings,
+                    )
+
+        payload = __import__("json").loads(stdout.getvalue())
+        self.assertEqual(0, result)
+        self.assertTrue(payload["ok"])
+        self.assertEqual("2026.8.0", payload["bw_version"])
+        self.assertNotIn("must-not-leak", stdout.getvalue())
+
+    def test_doctor_reports_invalid_settings_without_raising(self):
+        module = _load_plugin()
+        stdout = io.StringIO()
+
+        with contextlib.redirect_stdout(stdout):
+            result = module.vaultwarden_command(
+                argparse.Namespace(vaultwarden_action="doctor"),
+                {"enabled": True},
+            )
+
+        payload = __import__("json").loads(stdout.getvalue())
+        self.assertEqual(1, result)
+        self.assertFalse(payload["ok"])
+        self.assertTrue(payload["issues"])
+
+    def test_lookup_returns_only_sanitized_metadata_and_uuids(self):
+        module = _load_plugin()
+        item_id = "00000000-0000-4000-8000-000000000002"
+        collection_id = "00000000-0000-4000-8000-000000000001"
+        with TemporaryDirectory() as tmp:
+            binary = Path(tmp) / "bw"
+            binary.write_text(
+                "#!/usr/bin/python3\n"
+                "import json, sys\n"
+                "args = sys.argv[1:]\n"
+                "if args[0] == '--version': print('2026.8.0')\n"
+                "elif args[:2] == ['unlock', '--passwordenv']: print('must-not-leak-session')\n"
+                "elif args[:2] == ['list', 'collections']:\n"
+                f"    print(json.dumps([{{'id': '{collection_id}', 'name': 'Synthetic Collection'}}]))\n"
+                "elif args[:2] == ['list', 'items']:\n"
+                f"    print(json.dumps([{{'id': '{item_id}', 'name': 'Synthetic Item', "
+                f"'type': 1, 'collectionIds': ['{collection_id}'], "
+                "'login': {'username': 'must-not-leak-user', 'password': 'must-not-leak-password'}, "
+                "'notes': 'must-not-leak-notes', "
+                "'fields': [{'name': 'api-token', 'value': 'must-not-leak-field'}]}]))\n"
+                "raise SystemExit(0)\n",
+                encoding="utf-8",
+            )
+            binary.chmod(0o700)
+            settings = {
+                "server_url": "https://vault.example.invalid",
+                "binary_path": str(binary),
+            }
+            _pin_binary(settings, binary)
+            env = {
+                "BW_CLIENTID": "synthetic-client",
+                "BW_CLIENTSECRET": "must-not-leak-bootstrap",
+                "BW_PASSWORD": "synthetic-master",
+            }
+            stdout = io.StringIO()
+            with mock.patch.dict(os.environ, env, clear=True):
+                with contextlib.redirect_stdout(stdout):
+                    result = module.vaultwarden_command(
+                        argparse.Namespace(
+                            vaultwarden_action="lookup",
+                            query="Synthetic",
+                            collection="Synthetic Collection",
+                        ),
+                        settings,
+                    )
+
+        payload = __import__("json").loads(stdout.getvalue())
+        self.assertEqual(0, result)
+        self.assertEqual(item_id, payload["items"][0]["id"])
+        self.assertEqual([collection_id], payload["items"][0]["collection_ids"])
+        self.assertEqual(
+            ["fields.api-token", "login.password", "login.username", "notes"],
+            payload["items"][0]["available_fields"],
+        )
+        for secret in (
+            "must-not-leak-session",
+            "must-not-leak-user",
+            "must-not-leak-password",
+            "must-not-leak-notes",
+            "must-not-leak-field",
+            "must-not-leak-bootstrap",
+        ):
+            self.assertNotIn(secret, stdout.getvalue())
+
     def test_directory_plugin_manifest_declares_compatible_api_and_pinned_cli(self):
         manifest = MANIFEST_PATH.read_text(encoding="utf-8")
 
         self.assertIn("manifest_version: 2", manifest)
         self.assertIn("api_version: 1", manifest)
-        self.assertIn('version: "0.1.0"', manifest)
+        self.assertIn('version: "0.2.0"', manifest)
         self.assertIn("platforms: [linux]", manifest)
         self.assertIn("bw-cli-version: 2026.8.0", manifest)
 
     def test_registers_mapped_source_with_schema_and_protected_bootstrap_vars(self):
         module = _load_plugin()
         registered = []
-        module.register(types.SimpleNamespace(register_secret_source=registered.append))
+        module.register(types.SimpleNamespace(
+            get_config=lambda _key, default=None: default,
+            register_secret_source=registered.append,
+            register_cli_command=lambda **_kwargs: None,
+        ))
 
         self.assertEqual(1, len(registered))
         source = registered[0]
