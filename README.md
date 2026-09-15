@@ -11,6 +11,16 @@ The portable directory plugin, its synthetic unit/contract tests, and a
 disposable Hermes profile integration check are implemented. Host-specific
 service deployment remains a separate gated task.
 
+## Quickstart
+
+New operators start at [docs/quickstart.md](docs/quickstart.md): installation
+via `hermes plugins install`, prerequisites, Vaultwarden technical account and
+collections, `bw` installation, TPM2/systemd setup, settings via
+`hermes config set`, UUID lookup, bindings, diagnostics, rotation, upgrade and
+uninstall. The plugin also bundles an operator skill at
+[`vaultwarden_secret_source/skills/vaultwarden-secrets/SKILL.md`](vaultwarden_secret_source/skills/vaultwarden-secrets/SKILL.md)
+for safe day-to-day use inside Hermes.
+
 ## Plugin
 
 Deploy `vaultwarden_secret_source/` unchanged as a directory below
