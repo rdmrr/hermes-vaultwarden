@@ -36,14 +36,21 @@ code or documentation.
 Run the mandatory local checks with:
 
 ```bash
+export HERMES_AGENT_SRC=/path/to/pinned/hermes-agent
+export PYTHONPATH="${PWD}:${HERMES_AGENT_SRC}"
+python3 -m pip install --editable "${HERMES_AGENT_SRC}"
+python3 scripts/check_hermes_fixture.py
 python3 -m unittest discover -s tests -v
 python3 scripts/run_profile_integration.py
 python3 scripts/run_process_path_integration.py
-PYTHONPATH="${PROJECT_ROOT}:${HERMES_AGENT_SRC}" \
-  python3 -m unittest discover -s tests -p 'test_hermes_contract.py' -v
 python3 scripts/check_repository_safety.py
 git diff --cached --check
 ```
+
+Use the official `NousResearch/hermes-agent` source fixture pinned to commit
+`fef0bc56b2f622ffe124835fbf57adfd10aa17e6`. The CI workflow checks it out and
+installs it independently; the integration suites fail rather than skip when
+the declared fixture is unavailable.
 
 Deployment-specific configuration and verification evidence belong outside Git.
 Only generic templates with placeholders may be committed.

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import importlib.util
 import os
 import shutil
 import tempfile
@@ -9,18 +8,13 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-
-def _hermes_available() -> bool:
-    try:
-        return importlib.util.find_spec("agent.secret_sources.base") is not None
-    except (ImportError, ModuleNotFoundError):
-        return False
+from scripts.check_hermes_fixture import require_hermes_fixture
 
 
-HERMES_AVAILABLE = _hermes_available()
+def setUpModule() -> None:
+    require_hermes_fixture()
 
 
-@unittest.skipUnless(HERMES_AVAILABLE, "set PYTHONPATH to a compatible Hermes Agent checkout")
 class HermesContractIntegrationTests(unittest.TestCase):
     @staticmethod
     def _pin_fake_bw(cfg: dict, fake_bw: Path) -> None:
