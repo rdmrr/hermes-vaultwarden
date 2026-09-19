@@ -56,14 +56,53 @@ def _unit_path(layout: InstallLayout, path: Path) -> str:
     return "/" + path.relative_to(layout.root).as_posix()
 
 
+def _runtime_directory_name(layout: InstallLayout) -> str:
+    # RuntimeDirectory= must be a single path component; the unit name (minus
+    # ".service") plus the profile keeps it unique per managed installation
+    # without needing any specifier expansion.
+    return f"hermes-vaultwarden-{layout.unit.removesuffix('.service')}-{layout.profile}"
+
+
+def _runtime_env_path(layout: InstallLayout) -> str:
+    return f"/run/{_runtime_directory_name(layout)}/env"
+
+
 def render_drop_in(layout: InstallLayout) -> str:
+    # NOTE: systemd does NOT expand the "%d" (credentials directory)
+    # specifier inside EnvironmentFile= -- confirmed against systemd
+    # 255.4-1ubuntu8.17 with both TPM2-encrypted and plaintext credentials.
+    # EnvironmentFile= values are only specifier-expanded as *paths*; the
+    # runtime credentials directory ($CREDENTIALS_DIRECTORY / %d) is only
+    # populated once the service's credential machinery has already run and
+    # by then EnvironmentFile= has already been resolved, so a literal
+    # "%d/<name>" is never a valid path and the unit fails closed
+    # (Result=resources, "Failed to load environment files").
+    #
+    # Fix: keep LoadCredentialEncrypted= for the encrypted-at-rest secret
+    # material, but materialize the three BW_* environment assignments with
+    # a private ExecStartPre= helper that reads $CREDENTIALS_DIRECTORY and
+    # writes them into a fixed-path, mode-0700 RuntimeDirectory= that
+    # EnvironmentFile= (with the "-" no-such-file-is-fine prefix, since the
+    # file only exists while the service's private runtime directory is
+    # alive) can reference without any specifier.
+    runtime_directory = _runtime_directory_name(layout)
+    write_env_names = " ".join(CREDENTIAL_NAMES)
+    write_env_script = (
+        "/bin/sh -c 'umask 077; : > \"$RUNTIME_DIRECTORY/env\"; "
+        f"for n in {write_env_names}; do "
+        'printf "%s=%s\\n" "$n" "$(cat "$CREDENTIALS_DIRECTORY/$n")" '
+        '>> "$RUNTIME_DIRECTORY/env"; done\''
+    )
     lines = [
         "# Managed by hermes-vaultwarden-bootstrap. Do not add plaintext secrets.",
         "[Service]",
     ]
     for name, path in layout.credentials.items():
         lines.append(f"LoadCredentialEncrypted={name}:{_unit_path(layout, path)}")
-        lines.append(f"EnvironmentFile=%d/{name}")
+    lines.append(f"RuntimeDirectory={runtime_directory}")
+    lines.append("RuntimeDirectoryMode=0700")
+    lines.append(f"ExecStartPre={write_env_script}")
+    lines.append(f"EnvironmentFile=-{_runtime_env_path(layout)}")
     return "\n".join(lines) + "\n"
 
 

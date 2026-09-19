@@ -48,10 +48,23 @@ No value appears in an argument, YAML, manifest, status output, or diagnostic.
 Empty values, NUL bytes, and line breaks are rejected. The encrypted outputs are
 stored independently. No `BW_SESSION` value is accepted or persisted.
 
-The generated service drop-in uses one `LoadCredentialEncrypted=` and one
-`EnvironmentFile=%d/...` directive per bootstrap variable. systemd decrypts the
-files into its protected runtime credential directory when it starts the
-service, then loads the three environment assignments for the service process.
+The generated service drop-in uses `LoadCredentialEncrypted=` for the three
+encrypted-at-rest bootstrap variables, plus a private `RuntimeDirectory=`, a
+minimal `ExecStartPre=` helper, and `EnvironmentFile=-<runtime-path>`. systemd
+decrypts the credential files into its protected runtime credential
+directory when it starts the service; the `ExecStartPre=` helper then reads
+`$CREDENTIALS_DIRECTORY` and writes the three `BW_*` assignments into a
+mode-0700 runtime directory that only this unit owns, and `EnvironmentFile=`
+loads them for the service process from there.
+
+This two-step indirection exists because systemd does **not** expand the
+`%d` (credentials directory) specifier inside `EnvironmentFile=` — verified
+against systemd 255.4-1ubuntu8.17: a literal `EnvironmentFile=%d/<NAME>`
+directive fails every service start with `Failed to load environment files:
+No such file or directory`, because `EnvironmentFile=` paths are resolved
+before the credential machinery populates `%d`. The `-` prefix on
+`EnvironmentFile=-...` tolerates the file being briefly absent (e.g. during
+service reload) without failing the unit.
 
 ## Isolated paths and transactions
 

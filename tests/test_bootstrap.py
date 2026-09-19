@@ -76,7 +76,13 @@ class InstallLayoutTests(unittest.TestCase):
                 f"hermes-vaultwarden/profile-a/{name}.cred",
                 rendered,
             )
-            self.assertIn(f"EnvironmentFile=%d/{name}", rendered)
+        # Regression guard for the %d-in-EnvironmentFile= bug (VW-012):
+        # systemd never expands the "%d" credentials-directory specifier
+        # inside EnvironmentFile=, so that pattern must never come back.
+        self.assertNotIn("%d", rendered)
+        self.assertIn("RuntimeDirectory=", rendered)
+        self.assertIn("ExecStartPre=", rendered)
+        self.assertIn("EnvironmentFile=-/run/", rendered)
         self.assertNotIn("BW_SESSION", rendered)
         self.assertNotIn("/staging", rendered)
 
