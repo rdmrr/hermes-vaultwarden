@@ -49,7 +49,19 @@ class InstallLayout:
             credential_dir=credential_dir,
             drop_in=root / "etc/systemd/system" / f"{unit}.d/50-hermes-vaultwarden.conf",
             manifest=root / "etc/hermes-vaultwarden" / f"{profile}.json",
-            env_script=root / "etc/hermes-vaultwarden" / f"{profile}-write-env.sh",
+            # NOTE (VW-014): this directory is deliberately NOT
+            # etc/hermes-vaultwarden (the manifest's parent) or anything
+            # nested under it. That directory is 0700 root-only so that the
+            # manifest and other root-only state stay unreadable to the
+            # service user; ExecStartPre= processes in the rendered unit
+            # inherit the *target* unit's own User= (e.g. User=svc-hermes) --
+            # not root -- and a non-root process cannot open a file inside a
+            # 0700 directory it cannot traverse (x), regardless of the
+            # file's own mode. env_script instead lives in its own sibling
+            # directory that install() creates as 0755 (world-traversable)
+            # so any service User= can read and execute it. See
+            # docs/systemd-bootstrap.md for the chosen fix (option a).
+            env_script=root / "etc/hermes-vaultwarden-scripts" / f"{profile}-write-env.sh",
             credentials={name: credential_dir / f"{name}.cred" for name in CREDENTIAL_NAMES},
         )
 
@@ -334,6 +346,7 @@ def install(
         _make_directory(layout.credential_dir, 0o700, created_directories)
         _make_directory(layout.drop_in.parent, 0o755, created_directories)
         _make_directory(layout.manifest.parent, 0o700, created_directories)
+        _make_directory(layout.env_script.parent, 0o755, created_directories)
         for name, path in layout.credentials.items():
             _write_new(path, encrypted[name], 0o600, created_files)
         _write_new(layout.drop_in, render_drop_in(layout).encode("utf-8"), 0o644, created_files)
@@ -373,7 +386,12 @@ def remove(layout: InstallLayout, *, reload_systemd: Callable[[], None]) -> bool
     try:
         for path in targets:
             path.unlink()
-        for directory in (layout.credential_dir, layout.drop_in.parent, layout.manifest.parent):
+        for directory in (
+            layout.credential_dir,
+            layout.drop_in.parent,
+            layout.manifest.parent,
+            layout.env_script.parent,
+        ):
             try:
                 directory.rmdir()
             except OSError:
@@ -385,6 +403,7 @@ def remove(layout: InstallLayout, *, reload_systemd: Callable[[], None]) -> bool
         _make_directory(layout.credential_dir, 0o700, restored_directories)
         _make_directory(layout.drop_in.parent, 0o755, restored_directories)
         _make_directory(layout.manifest.parent, 0o700, restored_directories)
+        _make_directory(layout.env_script.parent, 0o755, restored_directories)
         for path, (content, mode) in snapshots.items():
             if not path.exists():
                 _write_new(path, content, mode, restored_files)

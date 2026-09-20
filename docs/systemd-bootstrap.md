@@ -86,6 +86,24 @@ isn't one of systemd's own specifiers — the directive now only names the
 helper script's path, and all `$`-variable usage lives inside that script's
 content, which systemd never parses.
 
+The helper script itself lives in its own directory,
+`/etc/hermes-vaultwarden-scripts/`, mode `0755` — deliberately **not**
+`/etc/hermes-vaultwarden/` (the manifest's parent), which is mode `0700`
+root-only. `ExecStartPre=` has no `User=` of its own, so it inherits the
+*target* unit's `User=` (e.g. `User=svc-hermes` on a real gateway service, not
+root); a non-root process cannot open a file inside a `0700` directory it
+cannot traverse, no matter what mode the file itself has. VW-014: a live
+cutover on `the target gateway service` (`User=svc-hermes`) crash-looped with
+`sh: 0: cannot open /etc/hermes-vaultwarden/profile-write-env.sh: Permission
+denied` because the script lived in the same `0700` directory as the
+manifest. The original regression test for the helper script didn't catch
+this because it wrote the script into a separately, more permissively
+chmod'd `state_dir` and ran the test unit implicitly as root — neither
+matches the real deployment. The fix (option a from the acceptance
+criteria): give the script its own `0755` directory, isolated from the
+`0700` manifest directory, so any service `User=` can read and execute it
+regardless of who owns the manifest.
+
 ## Isolated paths and transactions
 
 For profile `example-profile`, the managed targets are:
@@ -95,13 +113,15 @@ For profile `example-profile`, the managed targets are:
 /etc/credstore.encrypted/hermes-vaultwarden/example-profile/BW_CLIENTSECRET.cred
 /etc/credstore.encrypted/hermes-vaultwarden/example-profile/BW_PASSWORD.cred
 /etc/systemd/system/hermes-example.service.d/50-hermes-vaultwarden.conf
-/etc/hermes-vaultwarden/example-profile-write-env.sh
+/etc/hermes-vaultwarden-scripts/example-profile-write-env.sh
 /etc/hermes-vaultwarden/example-profile.json
 ```
 
 Profile and unit names are strictly validated and cannot contain path
 traversal. Credential files and the manifest use mode `0600`; the profile
-credential directory uses `0700`; the non-secret systemd drop-in uses `0644`.
+credential directory uses `0700`; the non-secret systemd drop-in uses `0644`;
+the env-script helper directory and file use `0755` (world-traversable, since
+`ExecStartPre=` runs as the target unit's own `User=`, not root).
 A complete matching installation is an idempotent no-op. Partial, modified,
 symlinked, incorrectly owned, or incorrectly permissioned targets fail closed
 rather than being overwritten.

@@ -41,6 +41,14 @@ class InstallLayoutTests(unittest.TestCase):
             layout.manifest,
         )
         self.assertEqual(
+            Path("/staging/etc/hermes-vaultwarden-scripts/profile-a-write-env.sh"),
+            layout.env_script,
+        )
+        # VW-014: env_script's parent must never be the manifest's parent --
+        # that directory is 0700 root-only and a non-root ExecStartPre=
+        # cannot traverse into it.
+        self.assertNotEqual(layout.manifest.parent, layout.env_script.parent)
+        self.assertEqual(
             {
                 "BW_CLIENTID": layout.credential_dir / "BW_CLIENTID.cred",
                 "BW_CLIENTSECRET": layout.credential_dir / "BW_CLIENTSECRET.cred",
@@ -193,6 +201,18 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(0o600, stat.S_IMODE(layout.manifest.stat().st_mode))
             self.assertEqual(0o644, stat.S_IMODE(layout.drop_in.stat().st_mode))
             self.assertEqual(0o700, stat.S_IMODE(layout.credential_dir.stat().st_mode))
+            self.assertEqual(0o755, stat.S_IMODE(layout.env_script.stat().st_mode))
+            # Regression guard for VW-014: env_script must live in its own
+            # world-traversable directory, never inside layout.manifest's
+            # 0700 root-only parent -- a non-root ExecStartPre= (which
+            # inherits the target unit's own User=, not root) cannot open a
+            # file inside a directory it cannot traverse, regardless of the
+            # file's own mode.
+            self.assertNotEqual(layout.manifest.parent, layout.env_script.parent)
+            self.assertEqual(0o700, stat.S_IMODE(layout.manifest.parent.stat().st_mode))
+            self.assertEqual(0o755, stat.S_IMODE(layout.env_script.parent.stat().st_mode))
+            self.assertTrue(stat.S_IMODE(layout.env_script.parent.stat().st_mode) & stat.S_IXOTH)
+            self.assertFalse(stat.S_IMODE(layout.manifest.parent.stat().st_mode) & stat.S_IXOTH)
 
     def test_wrong_permissions_are_not_treated_as_an_idempotent_install(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -256,7 +276,7 @@ class InstallTests(unittest.TestCase):
                 )
 
             self.assertEqual([True, True], reload_calls)
-            for path in (*layout.credentials.values(), layout.drop_in, layout.manifest):
+            for path in (*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest):
                 self.assertFalse(path.exists())
 
     def test_remove_deletes_only_managed_profile_and_is_idempotent(self):
@@ -283,7 +303,7 @@ class InstallTests(unittest.TestCase):
 
             self.assertEqual([True], reload_calls)
             self.assertEqual(b"encrypted-sibling", sibling.read_bytes())
-            for path in (*layout.credentials.values(), layout.drop_in, layout.manifest):
+            for path in (*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest):
                 self.assertFalse(path.exists())
 
     def test_remove_restores_files_when_daemon_reload_fails(self):
@@ -301,7 +321,7 @@ class InstallTests(unittest.TestCase):
             )
             before = {
                 path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                for path in (*layout.credentials.values(), layout.drop_in, layout.manifest)
+                for path in (*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest)
             }
             reload_calls = []
 
