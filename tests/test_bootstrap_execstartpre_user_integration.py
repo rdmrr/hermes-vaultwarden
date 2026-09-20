@@ -101,6 +101,7 @@ class RealNonRootExecStartPreTests(unittest.TestCase):
         secrets = {
             name: f"synthetic-{name.lower()}-{uuid.uuid4()}" for name in CREDENTIAL_NAMES
         }
+        self.secrets = secrets
         # install() itself creates the real layout on a throwaway --root:
         # env_script.parent as its own 0755 directory, and (crucially for
         # VW-014) layout.manifest.parent as a *separate* 0700 directory --
@@ -164,17 +165,29 @@ class RealNonRootExecStartPreTests(unittest.TestCase):
         service_lines.append(f"ExecStartPre=/bin/sh {env_script_path}")
         service_lines.append(f"EnvironmentFile=-/run/{runtime_directory}/env")
 
-        probe_script = (
-            "for n in BW_CLIENTID BW_CLIENTSECRET BW_PASSWORD; do "
-            'eval v=\\$$n; '
-            'if [ -n "$v" ]; then echo present:$n >> /tmp/hermes-vw-vw014-probe.out; '
-            'else echo missing:$n >> /tmp/hermes-vw-vw014-probe.out; fi; '
-            "done"
+        # Regression guard, also VW-013-class: the probe must run from a
+        # real script file via "ExecStart=/bin/sh <path>", not inline as
+        # "/bin/sh -c \"...\"" -- systemd's own command-line parsing of an
+        # Exec*= directive consumes literal "$" before the shell ever
+        # sees it, which corrupts the probe itself (not the code under
+        # test) and previously produced false "present:$n" positives.
+        # This unit's ExecStart= also inherits User=nobody, so the probe
+        # script must live in the same world-traversable env_script_dir,
+        # not a 0700-only directory.
+        probe_body = (
+            "#!/bin/sh\n"
+            "for n in BW_CLIENTID BW_CLIENTSECRET BW_PASSWORD; do\n"
+            "    eval v=\\$$n\n"
+            '    if [ -n "$v" ]; then echo "present:$n=$v" >> /tmp/hermes-vw-vw014-probe.out; '
+            'else echo missing:$n >> /tmp/hermes-vw-vw014-probe.out; fi\n'
+            "done\n"
         )
+        probe_script_path = env_script_dir / "probe.sh"
+        _write_root_file(probe_script_path, probe_body.encode(), mode="0755")
         self.probe_output = Path("/tmp/hermes-vw-vw014-probe.out")
         self.addCleanup(lambda: _sudo_n("rm", "-f", str(self.probe_output)))
         service_lines.append("Type=oneshot")
-        service_lines.append(f'ExecStart=/bin/sh -c "{probe_script}"')
+        service_lines.append(f"ExecStart=/bin/sh {probe_script_path}")
 
         self.unit_path = Path(f"/etc/systemd/system/{self.unit_name}.service")
         _write_root_file(
@@ -217,8 +230,24 @@ class RealNonRootExecStartPreTests(unittest.TestCase):
                     f"probe output: {probe.stdout!r}"
                 ),
             )
-        # Never assert on or print the actual synthetic secret values.
-        self.assertNotIn("synthetic-", probe.stdout)
+            # Regression guard for VW-015: a "present:NAME" hit alone is
+            # not proof the VALUE is correct -- the double-wrapping bug
+            # still reported "present" while carrying a mangled value
+            # like "NAME=<real-value-with-quotes>". Assert the exact
+            # value delivered to the child process matches the synthetic
+            # secret this test generated, with no NAME= prefix repeated
+            # and no surrounding quotes.
+            expected_line = f"present:{name}={self.secrets[name]}"
+            self.assertIn(
+                expected_line,
+                probe.stdout,
+                msg=(
+                    f"{name} reached the child process with the wrong "
+                    f"value (VW-015 double-wrap regression): expected "
+                    f"{expected_line!r}, got probe output {probe.stdout!r}"
+                ),
+            )
+            self.assertNotIn(f"{name}={name}=", probe.stdout)
 
 
 if __name__ == "__main__":

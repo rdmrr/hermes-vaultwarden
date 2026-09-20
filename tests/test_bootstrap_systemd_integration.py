@@ -87,10 +87,13 @@ class RealSystemdDropInTests(unittest.TestCase):
         credential_dir = Path(self.tmp.name) / "creds"
         credential_dir.mkdir()
         self.credential_files: dict[str, Path] = {}
+        self.secrets: dict[str, str] = {}
         for name in CREDENTIAL_NAMES:
+            value = f"synthetic-{name.lower()}-{uuid.uuid4()}"
+            self.secrets[name] = value
             encrypted = encrypt_credential(
                 name,
-                f"synthetic-{name.lower()}-{uuid.uuid4()}",
+                value,
                 run=_run_as_root,
             )
             path = credential_dir / f"{name}.cred"
@@ -135,13 +138,24 @@ class RealSystemdDropInTests(unittest.TestCase):
         return _sudo_n(*argv)
 
     def test_real_systemd_start_is_green_and_delivers_all_three_variables(self):
-        probe_script = (
-            "for n in BW_CLIENTID BW_CLIENTSECRET BW_PASSWORD; do "
-            'eval v=\\$$n; '
-            'if [ -n "$v" ]; then echo present:$n; else echo missing:$n; fi; '
-            "done"
+        # The probe script must be written to a real file and run via
+        # "/bin/sh <path>", exactly like the env script itself (VW-013):
+        # passing it inline as ExecStart=/bin/sh -c "..." lets systemd's
+        # own command-line parsing consume literal "$" characters before
+        # the shell ever sees them, corrupting the probe -- not the
+        # production code under test.
+        probe_body = (
+            "#!/bin/sh\n"
+            "for n in BW_CLIENTID BW_CLIENTSECRET BW_PASSWORD; do\n"
+            "    eval v=\\$$n\n"
+            '    if [ -n "$v" ]; then echo "present:$n=$v"; else echo missing:$n; fi\n'
+            "done\n"
         )
-        result = self._run_transient_unit("/bin/sh", "-c", probe_script)
+        probe_path = Path(self.tmp.name) / "probe.sh"
+        probe_path.write_text(probe_body)
+        probe_path.chmod(0o755)
+
+        result = self._run_transient_unit("/bin/sh", str(probe_path))
 
         self.assertEqual(
             0,
@@ -154,9 +168,20 @@ class RealSystemdDropInTests(unittest.TestCase):
                 result.stdout,
                 msg=f"{name} did not reach the child process environment",
             )
-        # Never assert on or print the actual synthetic secret values.
-        self.assertNotIn("synthetic-", result.stdout)
-        self.assertNotIn("synthetic-", result.stderr)
+            # Regression guard for VW-015: assert the EXACT value the
+            # child process saw, not just that the variable was set --
+            # the double-wrap bug still reported "present" while
+            # delivering a mangled "NAME=<value>" value.
+            self.assertIn(
+                f"present:{name}={self.secrets[name]}",
+                result.stdout,
+                msg=(
+                    f"{name} reached the child process with the wrong "
+                    f"value (VW-015 double-wrap regression); "
+                    f"stdout: {result.stdout!r}"
+                ),
+            )
+            self.assertNotIn(f"{name}={name}=", result.stdout)
 
 
 if __name__ == "__main__":

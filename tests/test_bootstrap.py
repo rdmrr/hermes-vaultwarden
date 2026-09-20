@@ -151,14 +151,98 @@ class CredentialEncryptionTests(unittest.TestCase):
             argv,
         )
         self.assertNotIn("synthetic value", " ".join(argv))
+        # Regression guard for VW-015: the encrypted payload must be the
+        # RAW value only -- no "NAME=" prefix and no shell quoting --
+        # because render_env_script() is the sole place that wraps a
+        # decrypted value into a "NAME=value" environment line. Wrapping
+        # it here too would double it into "NAME=NAME=value".
         self.assertEqual(
-            b'BW_PASSWORD="synthetic value with \\"quotes\\" and \\\\slashes"\n',
+            b'synthetic value with "quotes" and \\slashes',
             kwargs["input"],
         )
         self.assertEqual({"LANG": "C.UTF-8", "PATH": os.defpath}, kwargs["env"])
         self.assertNotIn("BW_SESSION", kwargs["env"])
         self.assertTrue(kwargs["capture_output"])
         self.assertFalse(kwargs["check"])
+
+
+class EnvScriptRoundTripTests(unittest.TestCase):
+    """Regression test for VW-015: render_env_script() must not re-wrap a
+    value that is already the raw credential content. This exercises the
+    *actual* shell script content (render_env_script's printf) against a
+    *actual* payload produced by _environment_payload(), run through a
+    real /bin/sh interpreter -- not just string-matching either function
+    in isolation, which is exactly what let VW-015 slip past review."""
+
+    def test_decrypted_payload_produces_single_name_equals_value_line(self):
+        import shutil
+        import subprocess
+
+        if shutil.which("sh") is None:
+            self.skipTest("/bin/sh not available")
+
+        layout = InstallLayout.for_system(
+            profile="profile-a",
+            unit="hermes-profile-a.service",
+            root=Path("/staging"),
+        )
+        script = render_env_script(layout)
+
+        synthetic_values = {
+            "BW_CLIENTID": "synthetic-clientid-VW015-check",
+            "BW_CLIENTSECRET": 'synthetic-secret-with-"quotes"-and-\\slashes',
+            "BW_PASSWORD": "synthetic-master-credential-VW015",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            credentials_directory = tmp_path / "creds"
+            credentials_directory.mkdir()
+            runtime_directory = tmp_path / "run"
+            runtime_directory.mkdir()
+
+            for name, value in synthetic_values.items():
+                # This is exactly what systemd-creds decrypt hands to the
+                # env script at runtime: the _environment_payload() bytes,
+                # decrypted back to plaintext.
+                (credentials_directory / name).write_bytes(
+                    value.encode("utf-8")
+                )
+
+            script_path = tmp_path / "write-env.sh"
+            script_path.write_text(script)
+            script_path.chmod(0o755)
+
+            result = subprocess.run(
+                ["/bin/sh", str(script_path)],
+                env={
+                    "CREDENTIALS_DIRECTORY": str(credentials_directory),
+                    "RUNTIME_DIRECTORY": str(runtime_directory),
+                    "PATH": os.defpath,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, result.returncode, msg=result.stderr)
+
+            env_file_content = (runtime_directory / "env").read_text()
+            lines = env_file_content.splitlines()
+            self.assertEqual(len(synthetic_values), len(lines))
+
+            for name, value in synthetic_values.items():
+                expected_line = f"{name}={value}"
+                self.assertIn(
+                    expected_line,
+                    lines,
+                    msg=(
+                        f"expected exact line {expected_line!r} in rendered "
+                        f"env file, got {env_file_content!r} (VW-015: "
+                        "double NAME= wrapping regression)"
+                    ),
+                )
+                # The specific double-wrap bug produced "NAME=NAME=value";
+                # guard directly against that pattern too.
+                self.assertNotIn(f"{name}={name}=", env_file_content)
 
 
 class InstallTests(unittest.TestCase):

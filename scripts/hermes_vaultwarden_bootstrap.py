@@ -149,12 +149,17 @@ def render_drop_in(layout: InstallLayout) -> str:
 
 
 def _environment_payload(name: str, value: str) -> bytes:
+    # The encrypted credential blob holds ONLY the raw secret value -- no
+    # "NAME=" prefix and no shell quoting. render_env_script() is the sole
+    # place that wraps a decrypted value into a "NAME=value" environment
+    # line (via its own printf), so wrapping it again here would double it
+    # into "NAME=NAME=value" (VW-015). Keep credential encryption and
+    # environment-line formatting as two separate, single-owner steps.
     if name not in CREDENTIAL_NAMES:
         raise ValueError("invalid credential name")
     if not value or any(character in value for character in ("\0", "\r", "\n")):
         raise ValueError("credential must be non-empty and single-line")
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'{name}="{escaped}"\n'.encode("utf-8")
+    return value.encode("utf-8")
 
 
 def encrypt_credential(
