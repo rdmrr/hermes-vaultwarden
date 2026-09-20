@@ -49,13 +49,13 @@ Empty values, NUL bytes, and line breaks are rejected. The encrypted outputs are
 stored independently. No `BW_SESSION` value is accepted or persisted.
 
 The generated service drop-in uses `LoadCredentialEncrypted=` for the three
-encrypted-at-rest bootstrap variables, plus a private `RuntimeDirectory=`, a
-minimal `ExecStartPre=` helper, and `EnvironmentFile=-<runtime-path>`. systemd
-decrypts the credential files into its protected runtime credential
-directory when it starts the service; the `ExecStartPre=` helper then reads
-`$CREDENTIALS_DIRECTORY` and writes the three `BW_*` assignments into a
-mode-0700 runtime directory that only this unit owns, and `EnvironmentFile=`
-loads them for the service process from there.
+encrypted-at-rest bootstrap variables, plus a private `RuntimeDirectory=`, an
+`ExecStartPre=` that runs a separate on-disk helper script, and
+`EnvironmentFile=-<runtime-path>`. systemd decrypts the credential files into
+its protected runtime credential directory when it starts the service; the
+helper script then reads `$CREDENTIALS_DIRECTORY` and writes the three `BW_*`
+assignments into a mode-0700 runtime directory that only this unit owns, and
+`EnvironmentFile=` loads them for the service process from there.
 
 This two-step indirection exists because systemd does **not** expand the
 `%d` (credentials directory) specifier inside `EnvironmentFile=` — verified
@@ -66,6 +66,26 @@ before the credential machinery populates `%d`. The `-` prefix on
 `EnvironmentFile=-...` tolerates the file being briefly absent (e.g. during
 service reload) without failing the unit.
 
+The helper's `for n in BW_CLIENTID ...; do ... "$n" ... done` loop lives in
+its own generated shell script file (`<profile>-write-env.sh`) rather than
+inline in the `ExecStartPre=` directive itself. An earlier revision put the
+loop directly into `ExecStartPre=/bin/sh -c '...for n in ...; do ... "$n" ...
+done...'`, which passed a test that set the directive via `systemd-run -p`
+but broke the very next real cutover: when the identical directive is loaded
+from an actual unit file on disk via a drop-in and `systemctl daemon-reload`,
+systemd performs its own `$VARIABLE`/`${VARIABLE}` substitution on `Exec*=`
+command lines before ever handing them to the shell — confirmed against
+systemd 255.4-1ubuntu8.17. Since `$n` is not one of systemd's own recognized
+variables, every occurrence silently collapsed to an unrelated value (the
+manager's own `$SHELL`), so the written env file ended up with three
+identical, wrong lines instead of the real bootstrap values, while the unit
+itself still started green. `systemd-run -p` does not exercise that
+substitution path, which is why it did not catch the regression. The fix:
+an `Exec*=` directive must never contain a literal `$`-prefixed token that
+isn't one of systemd's own specifiers — the directive now only names the
+helper script's path, and all `$`-variable usage lives inside that script's
+content, which systemd never parses.
+
 ## Isolated paths and transactions
 
 For profile `example-profile`, the managed targets are:
@@ -75,6 +95,7 @@ For profile `example-profile`, the managed targets are:
 /etc/credstore.encrypted/hermes-vaultwarden/example-profile/BW_CLIENTSECRET.cred
 /etc/credstore.encrypted/hermes-vaultwarden/example-profile/BW_PASSWORD.cred
 /etc/systemd/system/hermes-example.service.d/50-hermes-vaultwarden.conf
+/etc/hermes-vaultwarden/example-profile-write-env.sh
 /etc/hermes-vaultwarden/example-profile.json
 ```
 

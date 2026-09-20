@@ -16,6 +16,7 @@ from scripts.hermes_vaultwarden_bootstrap import (
     main,
     remove,
     render_drop_in,
+    render_env_script,
 )
 
 
@@ -85,6 +86,33 @@ class InstallLayoutTests(unittest.TestCase):
         self.assertIn("EnvironmentFile=-/run/", rendered)
         self.assertNotIn("BW_SESSION", rendered)
         self.assertNotIn("/staging", rendered)
+        # Regression guard for VW-013: systemd performs its own
+        # "$VARIABLE" substitution on Exec*= command lines when they are
+        # loaded from a real unit file (not just systemd-run -p), silently
+        # mangling any literal "$name" that isn't one of its own known
+        # variables. No Exec*= line may contain a literal "$" at all --
+        # the ExecStartPre= directive must only reference the env script's
+        # path, never inline shell variable expansion.
+        for line in rendered.splitlines():
+            if line.startswith("ExecStart") or line.startswith("ExecStop"):
+                self.assertNotIn("$", line)
+
+    def test_env_script_contains_the_actual_variable_loop(self):
+        layout = InstallLayout.for_system(
+            profile="profile-a",
+            unit="hermes-profile-a.service",
+            root=Path("/staging"),
+        )
+
+        script = render_env_script(layout)
+
+        self.assertTrue(script.startswith("#!/bin/sh"))
+        for name in ("BW_CLIENTID", "BW_CLIENTSECRET", "BW_PASSWORD"):
+            self.assertIn(name, script)
+        self.assertIn("$CREDENTIALS_DIRECTORY", script)
+        self.assertIn("$RUNTIME_DIRECTORY", script)
+        self.assertIn('"$n"', script)
+        self.assertNotIn("/staging", script)
 
 
 class CredentialEncryptionTests(unittest.TestCase):

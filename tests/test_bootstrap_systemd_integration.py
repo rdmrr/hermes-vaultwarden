@@ -28,6 +28,7 @@ from scripts.hermes_vaultwarden_bootstrap import (
     InstallLayout,
     encrypt_credential,
     render_drop_in,
+    render_env_script,
 )
 
 
@@ -97,10 +98,18 @@ class RealSystemdDropInTests(unittest.TestCase):
             path.chmod(0o644)  # world-readable so systemd (running as root) can load it
             self.credential_files[name] = path
 
+        # render_drop_in()'s ExecStartPre= now only names the on-disk env
+        # script's path (VW-013); materialize that script for real so
+        # systemd-run can actually execute it, world-readable/executable
+        # like the credential files above.
+        env_script_path = Path(self.tmp.name) / "write-env.sh"
+        env_script_path.write_text(render_env_script(self.layout))
+        env_script_path.chmod(0o755)
+
         # render_drop_in() encodes paths relative to layout.root; rewrite the
-        # rendered LoadCredentialEncrypted= directives to point at our real,
-        # throwaway encrypted files instead of layout.root's (nonexistent)
-        # /etc/credstore.encrypted/... path.
+        # rendered LoadCredentialEncrypted= directive and the ExecStartPre=
+        # script path to point at our real, throwaway files instead of
+        # layout.root's (nonexistent) /etc/... paths.
         raw_directives = _render_directives(self.layout)
         self.directives = []
         for directive in raw_directives:
@@ -109,6 +118,9 @@ class RealSystemdDropInTests(unittest.TestCase):
                 self.directives.append(
                     f"LoadCredentialEncrypted={name}:{self.credential_files[name]}"
                 )
+            elif directive.startswith("ExecStartPre="):
+                interpreter, _, _old_path = directive.removeprefix("ExecStartPre=").partition(" ")
+                self.directives.append(f"ExecStartPre={interpreter} {env_script_path}")
             else:
                 self.directives.append(directive)
 
