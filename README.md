@@ -7,19 +7,25 @@ persisting plaintext credentials in Hermes profile files.
 
 ## Status
 
-The portable directory plugin, its synthetic unit/contract tests, and a
-disposable Hermes profile integration check are implemented. Host-specific
-service deployment remains a separate gated task.
+The portable directory plugin, its unit/contract tests, the TPM2/systemd
+bootstrap helper, and a disposable Hermes profile integration check are
+implemented and verified against a real systemd service delivering
+TPM2-protected credentials end-to-end.
 
 ## Quickstart
 
-New operators start at [docs/quickstart.md](docs/quickstart.md): installation
-via `hermes plugins install`, prerequisites, Vaultwarden technical account and
-collections, `bw` installation, TPM2/systemd setup, settings via
-`hermes config set`, UUID lookup, bindings, diagnostics, rotation, upgrade and
-uninstall. The plugin also bundles an operator skill at
+New operators start at [docs/quickstart.md](docs/quickstart.md): install via
+`hermes plugins install`, set up the Vaultwarden technical account and
+collections, pin the `bw` CLI, run the TPM2/systemd bootstrap, verify with
+`hermes vaultwarden doctor`. The plugin also bundles an operator skill at
 [`vaultwarden_secret_source/skills/vaultwarden-secrets/SKILL.md`](vaultwarden_secret_source/skills/vaultwarden-secrets/SKILL.md)
 for safe day-to-day use inside Hermes.
+
+Use this plugin for **late-bound, optional application secrets** — not for
+bootstrap secrets a profile needs before plugin discovery runs (messaging
+tokens, provider credentials, Vaultwarden's own bootstrap credentials). A
+failed Vaultwarden fetch must never take down a profile's core startup.
+
 
 ## Plugin
 

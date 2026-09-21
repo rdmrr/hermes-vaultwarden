@@ -68,41 +68,22 @@ service reload) without failing the unit.
 
 The helper's `for n in BW_CLIENTID ...; do ... "$n" ... done` loop lives in
 its own generated shell script file (`<profile>-write-env.sh`) rather than
-inline in the `ExecStartPre=` directive itself. An earlier revision put the
-loop directly into `ExecStartPre=/bin/sh -c '...for n in ...; do ... "$n" ...
-done...'`, which passed a test that set the directive via `systemd-run -p`
-but broke the very next real cutover: when the identical directive is loaded
-from an actual unit file on disk via a drop-in and `systemctl daemon-reload`,
-systemd performs its own `$VARIABLE`/`${VARIABLE}` substitution on `Exec*=`
-command lines before ever handing them to the shell — confirmed against
-systemd 255.4-1ubuntu8.17. Since `$n` is not one of systemd's own recognized
-variables, every occurrence silently collapsed to an unrelated value (the
-manager's own `$SHELL`), so the written env file ended up with three
-identical, wrong lines instead of the real bootstrap values, while the unit
-itself still started green. `systemd-run -p` does not exercise that
-substitution path, which is why it did not catch the regression. The fix:
-an `Exec*=` directive must never contain a literal `$`-prefixed token that
-isn't one of systemd's own specifiers — the directive now only names the
-helper script's path, and all `$`-variable usage lives inside that script's
-content, which systemd never parses.
+inline in the `ExecStartPre=` directive. Any `$`-prefixed token inside an
+`Exec*=` directive itself is substituted by systemd before the shell ever
+sees it — a `$n` there silently resolves to an unrelated systemd variable
+instead of the loop value. The directive therefore only names the helper
+script's path; all `$`-variable usage lives inside that script's content,
+which systemd never parses.
 
 The helper script itself lives in its own directory,
 `/etc/hermes-vaultwarden-scripts/`, mode `0755` — deliberately **not**
 `/etc/hermes-vaultwarden/` (the manifest's parent), which is mode `0700`
 root-only. `ExecStartPre=` has no `User=` of its own, so it inherits the
-*target* unit's `User=` (e.g. `User=svc-hermes` on a real gateway service, not
-root); a non-root process cannot open a file inside a `0700` directory it
-cannot traverse, no matter what mode the file itself has. VW-014: a live
-cutover on `the target gateway service` (`User=svc-hermes`) crash-looped with
-`sh: 0: cannot open /etc/hermes-vaultwarden/profile-write-env.sh: Permission
-denied` because the script lived in the same `0700` directory as the
-manifest. The original regression test for the helper script didn't catch
-this because it wrote the script into a separately, more permissively
-chmod'd `state_dir` and ran the test unit implicitly as root — neither
-matches the real deployment. The fix (option a from the acceptance
-criteria): give the script its own `0755` directory, isolated from the
-`0700` manifest directory, so any service `User=` can read and execute it
-regardless of who owns the manifest.
+*target* unit's `User=` (often a non-root service account); such a process
+cannot open a file inside a `0700` directory it cannot traverse, regardless
+of the file's own mode. Isolating the script into its own world-traversable
+directory keeps it readable by any service `User=` without loosening the
+`0700` manifest directory it doesn't need to share.
 
 ## Isolated paths and transactions
 
