@@ -16,6 +16,7 @@ from scripts.hermes_vaultwarden_bootstrap import (
     main,
     remove,
     render_drop_in,
+    render_env_script,
 )
 
 
@@ -39,6 +40,14 @@ class InstallLayoutTests(unittest.TestCase):
             Path("/staging/etc/hermes-vaultwarden/profile-a.json"),
             layout.manifest,
         )
+        self.assertEqual(
+            Path("/staging/etc/hermes-vaultwarden-scripts/profile-a-write-env.sh"),
+            layout.env_script,
+        )
+        # VW-014: env_script's parent must never be the manifest's parent --
+        # that directory is 0700 root-only and a non-root ExecStartPre=
+        # cannot traverse into it.
+        self.assertNotEqual(layout.manifest.parent, layout.env_script.parent)
         self.assertEqual(
             {
                 "BW_CLIENTID": layout.credential_dir / "BW_CLIENTID.cred",
@@ -76,9 +85,42 @@ class InstallLayoutTests(unittest.TestCase):
                 f"hermes-vaultwarden/profile-a/{name}.cred",
                 rendered,
             )
-            self.assertIn(f"EnvironmentFile=%d/{name}", rendered)
+        # Regression guard for the %d-in-EnvironmentFile= bug (VW-012):
+        # systemd never expands the "%d" credentials-directory specifier
+        # inside EnvironmentFile=, so that pattern must never come back.
+        self.assertNotIn("%d", rendered)
+        self.assertIn("RuntimeDirectory=", rendered)
+        self.assertIn("ExecStartPre=", rendered)
+        self.assertIn("EnvironmentFile=-/run/", rendered)
         self.assertNotIn("BW_SESSION", rendered)
         self.assertNotIn("/staging", rendered)
+        # Regression guard for VW-013: systemd performs its own
+        # "$VARIABLE" substitution on Exec*= command lines when they are
+        # loaded from a real unit file (not just systemd-run -p), silently
+        # mangling any literal "$name" that isn't one of its own known
+        # variables. No Exec*= line may contain a literal "$" at all --
+        # the ExecStartPre= directive must only reference the env script's
+        # path, never inline shell variable expansion.
+        for line in rendered.splitlines():
+            if line.startswith("ExecStart") or line.startswith("ExecStop"):
+                self.assertNotIn("$", line)
+
+    def test_env_script_contains_the_actual_variable_loop(self):
+        layout = InstallLayout.for_system(
+            profile="profile-a",
+            unit="hermes-profile-a.service",
+            root=Path("/staging"),
+        )
+
+        script = render_env_script(layout)
+
+        self.assertTrue(script.startswith("#!/bin/sh"))
+        for name in ("BW_CLIENTID", "BW_CLIENTSECRET", "BW_PASSWORD"):
+            self.assertIn(name, script)
+        self.assertIn("$CREDENTIALS_DIRECTORY", script)
+        self.assertIn("$RUNTIME_DIRECTORY", script)
+        self.assertIn('"$n"', script)
+        self.assertNotIn("/staging", script)
 
 
 class CredentialEncryptionTests(unittest.TestCase):
@@ -109,14 +151,98 @@ class CredentialEncryptionTests(unittest.TestCase):
             argv,
         )
         self.assertNotIn("synthetic value", " ".join(argv))
+        # Regression guard for VW-015: the encrypted payload must be the
+        # RAW value only -- no "NAME=" prefix and no shell quoting --
+        # because render_env_script() is the sole place that wraps a
+        # decrypted value into a "NAME=value" environment line. Wrapping
+        # it here too would double it into "NAME=NAME=value".
         self.assertEqual(
-            b'BW_PASSWORD="synthetic value with \\"quotes\\" and \\\\slashes"\n',
+            b'synthetic value with "quotes" and \\slashes',
             kwargs["input"],
         )
         self.assertEqual({"LANG": "C.UTF-8", "PATH": os.defpath}, kwargs["env"])
         self.assertNotIn("BW_SESSION", kwargs["env"])
         self.assertTrue(kwargs["capture_output"])
         self.assertFalse(kwargs["check"])
+
+
+class EnvScriptRoundTripTests(unittest.TestCase):
+    """Regression test for VW-015: render_env_script() must not re-wrap a
+    value that is already the raw credential content. This exercises the
+    *actual* shell script content (render_env_script's printf) against a
+    *actual* payload produced by _environment_payload(), run through a
+    real /bin/sh interpreter -- not just string-matching either function
+    in isolation, which is exactly what let VW-015 slip past review."""
+
+    def test_decrypted_payload_produces_single_name_equals_value_line(self):
+        import shutil
+        import subprocess
+
+        if shutil.which("sh") is None:
+            self.skipTest("/bin/sh not available")
+
+        layout = InstallLayout.for_system(
+            profile="profile-a",
+            unit="hermes-profile-a.service",
+            root=Path("/staging"),
+        )
+        script = render_env_script(layout)
+
+        synthetic_values = {
+            "BW_CLIENTID": "synthetic-clientid-VW015-check",
+            "BW_CLIENTSECRET": 'synthetic-secret-with-"quotes"-and-\\slashes',
+            "BW_PASSWORD": "synthetic-master-credential-VW015",
+        }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            credentials_directory = tmp_path / "creds"
+            credentials_directory.mkdir()
+            runtime_directory = tmp_path / "run"
+            runtime_directory.mkdir()
+
+            for name, value in synthetic_values.items():
+                # This is exactly what systemd-creds decrypt hands to the
+                # env script at runtime: the _environment_payload() bytes,
+                # decrypted back to plaintext.
+                (credentials_directory / name).write_bytes(
+                    value.encode("utf-8")
+                )
+
+            script_path = tmp_path / "write-env.sh"
+            script_path.write_text(script)
+            script_path.chmod(0o755)
+
+            result = subprocess.run(
+                ["/bin/sh", str(script_path)],
+                env={
+                    "CREDENTIALS_DIRECTORY": str(credentials_directory),
+                    "RUNTIME_DIRECTORY": str(runtime_directory),
+                    "PATH": os.defpath,
+                },
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(0, result.returncode, msg=result.stderr)
+
+            env_file_content = (runtime_directory / "env").read_text()
+            lines = env_file_content.splitlines()
+            self.assertEqual(len(synthetic_values), len(lines))
+
+            for name, value in synthetic_values.items():
+                expected_line = f"{name}={value}"
+                self.assertIn(
+                    expected_line,
+                    lines,
+                    msg=(
+                        f"expected exact line {expected_line!r} in rendered "
+                        f"env file, got {env_file_content!r} (VW-015: "
+                        "double NAME= wrapping regression)"
+                    ),
+                )
+                # The specific double-wrap bug produced "NAME=NAME=value";
+                # guard directly against that pattern too.
+                self.assertNotIn(f"{name}={name}=", env_file_content)
 
 
 class InstallTests(unittest.TestCase):
@@ -159,6 +285,18 @@ class InstallTests(unittest.TestCase):
             self.assertEqual(0o600, stat.S_IMODE(layout.manifest.stat().st_mode))
             self.assertEqual(0o644, stat.S_IMODE(layout.drop_in.stat().st_mode))
             self.assertEqual(0o700, stat.S_IMODE(layout.credential_dir.stat().st_mode))
+            self.assertEqual(0o755, stat.S_IMODE(layout.env_script.stat().st_mode))
+            # Regression guard for VW-014: env_script must live in its own
+            # world-traversable directory, never inside layout.manifest's
+            # 0700 root-only parent -- a non-root ExecStartPre= (which
+            # inherits the target unit's own User=, not root) cannot open a
+            # file inside a directory it cannot traverse, regardless of the
+            # file's own mode.
+            self.assertNotEqual(layout.manifest.parent, layout.env_script.parent)
+            self.assertEqual(0o700, stat.S_IMODE(layout.manifest.parent.stat().st_mode))
+            self.assertEqual(0o755, stat.S_IMODE(layout.env_script.parent.stat().st_mode))
+            self.assertTrue(stat.S_IMODE(layout.env_script.parent.stat().st_mode) & stat.S_IXOTH)
+            self.assertFalse(stat.S_IMODE(layout.manifest.parent.stat().st_mode) & stat.S_IXOTH)
 
     def test_wrong_permissions_are_not_treated_as_an_idempotent_install(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -222,7 +360,7 @@ class InstallTests(unittest.TestCase):
                 )
 
             self.assertEqual([True, True], reload_calls)
-            for path in (*layout.credentials.values(), layout.drop_in, layout.manifest):
+            for path in (*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest):
                 self.assertFalse(path.exists())
 
     def test_remove_deletes_only_managed_profile_and_is_idempotent(self):
@@ -249,7 +387,7 @@ class InstallTests(unittest.TestCase):
 
             self.assertEqual([True], reload_calls)
             self.assertEqual(b"encrypted-sibling", sibling.read_bytes())
-            for path in (*layout.credentials.values(), layout.drop_in, layout.manifest):
+            for path in (*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest):
                 self.assertFalse(path.exists())
 
     def test_remove_restores_files_when_daemon_reload_fails(self):
@@ -267,7 +405,7 @@ class InstallTests(unittest.TestCase):
             )
             before = {
                 path: (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-                for path in (*layout.credentials.values(), layout.drop_in, layout.manifest)
+                for path in (*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest)
             }
             reload_calls = []
 

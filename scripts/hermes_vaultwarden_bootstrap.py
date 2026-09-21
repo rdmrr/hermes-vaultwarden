@@ -30,6 +30,7 @@ class InstallLayout:
     credential_dir: Path
     drop_in: Path
     manifest: Path
+    env_script: Path
     credentials: dict[str, Path]
 
     @classmethod
@@ -48,6 +49,19 @@ class InstallLayout:
             credential_dir=credential_dir,
             drop_in=root / "etc/systemd/system" / f"{unit}.d/50-hermes-vaultwarden.conf",
             manifest=root / "etc/hermes-vaultwarden" / f"{profile}.json",
+            # NOTE (VW-014): this directory is deliberately NOT
+            # etc/hermes-vaultwarden (the manifest's parent) or anything
+            # nested under it. That directory is 0700 root-only so that the
+            # manifest and other root-only state stay unreadable to the
+            # service user; ExecStartPre= processes in the rendered unit
+            # inherit the *target* unit's own User= (e.g. User=svc-hermes) --
+            # not root -- and a non-root process cannot open a file inside a
+            # 0700 directory it cannot traverse (x), regardless of the
+            # file's own mode. env_script instead lives in its own sibling
+            # directory that install() creates as 0755 (world-traversable)
+            # so any service User= can read and execute it. See
+            # docs/systemd-bootstrap.md for the chosen fix (option a).
+            env_script=root / "etc/hermes-vaultwarden-scripts" / f"{profile}-write-env.sh",
             credentials={name: credential_dir / f"{name}.cred" for name in CREDENTIAL_NAMES},
         )
 
@@ -56,24 +70,96 @@ def _unit_path(layout: InstallLayout, path: Path) -> str:
     return "/" + path.relative_to(layout.root).as_posix()
 
 
+def _runtime_directory_name(layout: InstallLayout) -> str:
+    # RuntimeDirectory= must be a single path component; the unit name (minus
+    # ".service") plus the profile keeps it unique per managed installation
+    # without needing any specifier expansion.
+    return f"hermes-vaultwarden-{layout.unit.removesuffix('.service')}-{layout.profile}"
+
+
+def _runtime_env_path(layout: InstallLayout) -> str:
+    return f"/run/{_runtime_directory_name(layout)}/env"
+
+
+def render_env_script(layout: InstallLayout) -> str:
+    # This script's *content* is never parsed or substituted by systemd --
+    # only its path appears in the unit's ExecStartPre= directive (see
+    # render_drop_in()). $CREDENTIALS_DIRECTORY and $RUNTIME_DIRECTORY are
+    # real process environment variables systemd sets before exec'ing this
+    # script's interpreter, and "$n" is an ordinary POSIX shell loop
+    # variable -- both are safe here because the shell that evaluates them
+    # is /bin/sh reading this file, not systemd's own command-line parser.
+    lines = [
+        "#!/bin/sh",
+        "# Managed by hermes-vaultwarden-bootstrap. Do not add plaintext secrets.",
+        "set -eu",
+        "umask 077",
+        ': > "$RUNTIME_DIRECTORY/env"',
+        f"for n in {' '.join(CREDENTIAL_NAMES)}; do",
+        '    printf "%s=%s\\n" "$n" "$(cat "$CREDENTIALS_DIRECTORY/$n")" >> "$RUNTIME_DIRECTORY/env"',
+        "done",
+    ]
+    return "\n".join(lines) + "\n"
+
+
 def render_drop_in(layout: InstallLayout) -> str:
+    # NOTE: systemd does NOT expand the "%d" (credentials directory)
+    # specifier inside EnvironmentFile= -- confirmed against systemd
+    # 255.4-1ubuntu8.17 with both TPM2-encrypted and plaintext credentials.
+    # EnvironmentFile= values are only specifier-expanded as *paths*; the
+    # runtime credentials directory ($CREDENTIALS_DIRECTORY / %d) is only
+    # populated once the service's credential machinery has already run and
+    # by then EnvironmentFile= has already been resolved, so a literal
+    # "%d/<name>" is never a valid path and the unit fails closed
+    # (Result=resources, "Failed to load environment files"). (VW-012)
+    #
+    # NOTE (VW-013): the VW-012 fix originally inlined a "for n in ...; do
+    # ... \"$n\" ... done" loop directly into ExecStartPre=/bin/sh -c '...'.
+    # That works when set via `systemd-run -p ExecStartPre=...`, but when
+    # the identical directive is loaded from a real unit file on disk (via
+    # a drop-in + `systemctl daemon-reload`), systemd performs its own
+    # "$VARIABLE"/"${VARIABLE}" substitution on Exec*= command lines BEFORE
+    # handing them to the shell -- confirmed against systemd
+    # 255.4-1ubuntu8.17. Since "$n" is not a real environment variable known
+    # to systemd, that substitution silently replaces every "$n" with an
+    # unrelated value (observed: the manager's $SHELL), so the loop variable
+    # never reaches the shell and every written line collapses to the same
+    # (wrong) text. `systemd-run -p` does not exhibit this because it wires
+    # the directive through a different, non-unit-file code path.
+    #
+    # Fix: an Exec*= directive must never contain a literal "$"-prefixed
+    # token that is not one of systemd's own recognized variables. The loop
+    # now lives entirely inside a separate, on-disk shell script
+    # (render_env_script()) whose *content* systemd never parses; the
+    # ExecStartPre= directive itself only names that script's path, so
+    # there is nothing left for systemd's command-line substitution to
+    # (mis)interpret.
+    runtime_directory = _runtime_directory_name(layout)
     lines = [
         "# Managed by hermes-vaultwarden-bootstrap. Do not add plaintext secrets.",
         "[Service]",
     ]
     for name, path in layout.credentials.items():
         lines.append(f"LoadCredentialEncrypted={name}:{_unit_path(layout, path)}")
-        lines.append(f"EnvironmentFile=%d/{name}")
+    lines.append(f"RuntimeDirectory={runtime_directory}")
+    lines.append("RuntimeDirectoryMode=0700")
+    lines.append(f"ExecStartPre=/bin/sh {_unit_path(layout, layout.env_script)}")
+    lines.append(f"EnvironmentFile=-{_runtime_env_path(layout)}")
     return "\n".join(lines) + "\n"
 
 
 def _environment_payload(name: str, value: str) -> bytes:
+    # The encrypted credential blob holds ONLY the raw secret value -- no
+    # "NAME=" prefix and no shell quoting. render_env_script() is the sole
+    # place that wraps a decrypted value into a "NAME=value" environment
+    # line (via its own printf), so wrapping it again here would double it
+    # into "NAME=NAME=value" (VW-015). Keep credential encryption and
+    # environment-line formatting as two separate, single-owner steps.
     if name not in CREDENTIAL_NAMES:
         raise ValueError("invalid credential name")
     if not value or any(character in value for character in ("\0", "\r", "\n")):
         raise ValueError("credential must be non-empty and single-line")
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
-    return f'{name}="{escaped}"\n'.encode("utf-8")
+    return value.encode("utf-8")
 
 
 def encrypt_credential(
@@ -154,6 +240,12 @@ def is_installed(layout: InstallLayout) -> bool:
                 mode=0o644,
                 owner=owner,
                 expected=render_drop_in(layout).encode("utf-8"),
+            )
+            and _secure_file_matches(
+                layout.env_script,
+                mode=0o755,
+                owner=owner,
+                expected=render_env_script(layout).encode("utf-8"),
             )
             and _secure_file_matches(
                 layout.manifest,
@@ -242,7 +334,7 @@ def install(
     """Install one profile transactionally; return False for an exact no-op."""
     if is_installed(layout):
         return False
-    targets = [*layout.credentials.values(), layout.drop_in, layout.manifest]
+    targets = [*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest]
     if any(path.exists() or path.is_symlink() for path in targets):
         raise RuntimeError("partial or conflicting installation exists")
     if set(secrets) != set(CREDENTIAL_NAMES):
@@ -259,9 +351,11 @@ def install(
         _make_directory(layout.credential_dir, 0o700, created_directories)
         _make_directory(layout.drop_in.parent, 0o755, created_directories)
         _make_directory(layout.manifest.parent, 0o700, created_directories)
+        _make_directory(layout.env_script.parent, 0o755, created_directories)
         for name, path in layout.credentials.items():
             _write_new(path, encrypted[name], 0o600, created_files)
         _write_new(layout.drop_in, render_drop_in(layout).encode("utf-8"), 0o644, created_files)
+        _write_new(layout.env_script, render_env_script(layout).encode("utf-8"), 0o755, created_files)
         _write_new(layout.manifest, _manifest_bytes(layout), 0o600, created_files)
         reload_attempted = True
         reload_systemd()
@@ -284,7 +378,7 @@ def install(
 
 def remove(layout: InstallLayout, *, reload_systemd: Callable[[], None]) -> bool:
     """Remove one exact managed installation; return False when absent."""
-    targets = [*layout.credentials.values(), layout.drop_in, layout.manifest]
+    targets = [*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest]
     if not any(path.exists() or path.is_symlink() for path in targets):
         return False
     if not is_installed(layout):
@@ -297,7 +391,12 @@ def remove(layout: InstallLayout, *, reload_systemd: Callable[[], None]) -> bool
     try:
         for path in targets:
             path.unlink()
-        for directory in (layout.credential_dir, layout.drop_in.parent, layout.manifest.parent):
+        for directory in (
+            layout.credential_dir,
+            layout.drop_in.parent,
+            layout.manifest.parent,
+            layout.env_script.parent,
+        ):
             try:
                 directory.rmdir()
             except OSError:
@@ -309,6 +408,7 @@ def remove(layout: InstallLayout, *, reload_systemd: Callable[[], None]) -> bool
         _make_directory(layout.credential_dir, 0o700, restored_directories)
         _make_directory(layout.drop_in.parent, 0o755, restored_directories)
         _make_directory(layout.manifest.parent, 0o700, restored_directories)
+        _make_directory(layout.env_script.parent, 0o755, restored_directories)
         for path, (content, mode) in snapshots.items():
             if not path.exists():
                 _write_new(path, content, mode, restored_files)
@@ -372,7 +472,7 @@ def check_prerequisites(
 
 def _show_plan(layout: InstallLayout, *, action: str, stdout: TextIO) -> None:
     print(f"PREVIEW: {action} profile {layout.profile} for {layout.unit}", file=stdout)
-    for path in (*layout.credentials.values(), layout.drop_in, layout.manifest):
+    for path in (*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest):
         print(f"  {_unit_path(layout, path)}", file=stdout)
     print("no files were changed; pass --apply to execute", file=stdout)
 
@@ -430,7 +530,7 @@ def main(
         print("prerequisites: ok", file=stdout)
         return 0
     if args.command == "status":
-        targets = [*layout.credentials.values(), layout.drop_in, layout.manifest]
+        targets = [*layout.credentials.values(), layout.drop_in, layout.env_script, layout.manifest]
         path_states = [_path_state(path) for path in targets]
         if is_installed(layout):
             state = "installed"
