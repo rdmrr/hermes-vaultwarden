@@ -204,6 +204,53 @@ hermes config unset plugins.entries.hermes-vaultwarden
 `remove --apply` restores the previous exact state on any failure (atomic
 snapshot/rollback) and never touches a sibling profile's credentials.
 
+## How agents actually consume a secret (no browser_vault_*, no fetch code)
+
+This plugin's whole job ends at Hermes' gateway startup: it resolves each
+`env.<VAR>` binding from Vaultwarden and injects the *value* directly into
+the running gateway process's environment — the same mechanism Hermes uses
+for provider API keys. An agent never calls anything to "get" the secret; it
+already exists as `$TASMOTA_PASSWORD` (or whatever var name was bound) in the
+process environment the moment the gateway is up.
+
+To actually use it, an agent writes a `terminal`/`execute_code` command that
+*references* the variable by name and lets the shell substitute it at
+execution time — for example an authenticated HTTP request built with the
+username/password variables interpolated by the shell, or a script that
+reads the value from the process environment by name. The agent's own
+context never contains the literal value; Hermes forwards it into the child
+process at execution time (and only if the variable is declared in
+`terminal.env_passthrough` or the skill's `required_environment_variables` —
+see `secrets.md#secrets-in-child-processes` in the Hermes docs).
+
+**This only works for non-interactive tools that read environment
+variables** (terminal commands, HTTP requests, scripts). It does **not**
+apply to typing a password into a live browser form — there is no
+`env.<VAR>` equivalent for that.
+
+### `browser_vault_*` is a different, unrelated system — never use it for this plugin's secrets
+
+Hermes ships a separate, built-in vault backend (`browser_vault_list`,
+`browser_vault_fill`, `browser_vault_save_login`, `browser_vault_unlock`)
+that talks to the *operator's own* Bitwarden/1Password account for filling
+*browser login forms*. It is unrelated to this plugin, has its own unlock
+flow (interactive master-password prompt), and — critically — **requires an
+actual Bitwarden/1Password subscription bound to that Hermes install**. If
+the operator has no such subscription, this backend is permanently
+`locked`/`unavailable_in_this_session`; that is not a transient state to
+wait out, it is a dead end.
+
+If a task needs a secret that this plugin manages, the only two ways to
+reach it are:
+
+1. A shell/env-based tool (see above) — works today for whatever is already
+   bound in `plugins.entries.hermes-vaultwarden.settings.env`.
+2. The secret isn't bound yet: ask the operator to add an `env:` binding for
+   it (`hermes vaultwarden lookup` to find the UUID, then `hermes config
+   set plugins.entries.hermes-vaultwarden.settings.env ...`, then restart
+   the gateway) — never reach for `browser_vault_*` as a workaround, and
+   never suggest the operator "unlock Bitwarden" for this plugin's secrets.
+
 ## Pitfalls
 
 - `doctor`/`status`/`lookup` never make Hermes apply a secret — only a real
