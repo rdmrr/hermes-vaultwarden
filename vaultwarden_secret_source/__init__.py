@@ -1094,6 +1094,22 @@ def register(ctx) -> None:
         handler_fn=lambda args: vaultwarden_command(args, settings),
         description="Safe UUID lookup, status, doctor, and configuration help.",
     )
+    try:
+        from vaultwarden_secret_source.browser_fill import (
+            VAULTWARDEN_BROWSER_FILL_SCHEMA,
+            check_vaultwarden_browser_fill,
+            handle_vaultwarden_browser_fill,
+        )
+        ctx.register_tool(
+            name="vaultwarden_browser_fill",
+            toolset="hermes-vaultwarden",
+            schema=VAULTWARDEN_BROWSER_FILL_SCHEMA,
+            handler=lambda args, **kw: handle_vaultwarden_browser_fill(args, settings, **kw),
+            check_fn=lambda: check_vaultwarden_browser_fill(settings),
+            emoji="\U0001f510",
+        )
+    except Exception:  # noqa: BLE001 - a broken optional tool must never break plugin load
+        pass
     register_skill = getattr(ctx, "register_skill", None)
     if callable(register_skill):
         skill_path = Path(__file__).parent / "skills" / "vaultwarden-secrets"
