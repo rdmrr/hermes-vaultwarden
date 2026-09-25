@@ -112,6 +112,18 @@ def _install_contract_stub() -> None:
     sys.modules["agent.secret_sources.base"] = base
 
 
+def tearDownModule() -> None:
+    # The stub installed by _install_contract_stub() replaces the real
+    # ``agent`` package tree in sys.modules for the duration of this test
+    # module. Other test modules (test_hermes_contract, test_process_paths,
+    # test_profile_integration, test_scanner_false_positive) require the
+    # real pinned Hermes fixture's ``agent.secret_sources.base`` to be
+    # importable, so this stub must not leak past this module's tests.
+    sys.modules.pop("vaultwarden_secret_source", None)
+    for name in ("agent.secret_sources.base", "agent.secret_sources", "agent"):
+        sys.modules.pop(name, None)
+
+
 def _load_plugin():
     _install_contract_stub()
     spec = importlib.util.spec_from_file_location("vaultwarden_secret_source", PLUGIN_PATH)

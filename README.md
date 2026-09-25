@@ -8,9 +8,11 @@ persisting plaintext credentials in Hermes profile files.
 ## Status
 
 The portable directory plugin, its unit/contract tests, the TPM2/systemd
-bootstrap helper, and a disposable Hermes profile integration check are
-implemented and verified against a real systemd service delivering
-TPM2-protected credentials end-to-end.
+bootstrap helper, a disposable Hermes profile integration check, and the
+interactive `vaultwarden_browser_fill` CDP tool (types an allowlisted field
+directly into a focused browser input, value never returned to the tool
+caller) are implemented and verified against a real systemd service and a
+real headless Chromium instance end-to-end.
 
 ## Quickstart
 

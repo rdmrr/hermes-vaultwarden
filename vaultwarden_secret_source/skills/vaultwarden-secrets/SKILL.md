@@ -1,7 +1,7 @@
 ---
 name: vaultwarden-secrets
 description: Use when operating the hermes-vaultwarden plugin (lookup/status/doctor/config, rotation, uninstall). Never print secret values.
-version: 0.2.0
+version: 0.3.0
 author: hermes-vaultwarden
 license: MIT
 platforms: [linux]
@@ -204,6 +204,50 @@ hermes config unset plugins.entries.hermes-vaultwarden
 `remove --apply` restores the previous exact state on any failure (atomic
 snapshot/rollback) and never touches a sibling profile's credentials.
 
+## Interactive fill into a browser form: `vaultwarden_browser_fill`
+
+For the one case env-var injection cannot cover — typing a credential into a
+*live browser login form* — use the `vaultwarden_browser_fill` tool. It fetches
+the allowlisted field server-side (same `bw` mechanism as env bindings) and
+types it directly into an already-focused input over CDP; **the value never
+appears in the tool's return string, in any error message, or anywhere else
+the LLM conversation or `dump_api_request_debug()` could persist it.**
+
+```
+vaultwarden_browser_fill(
+  item_id="<item-uuid>",        # must be in allowed_item_ids
+  field="login.password",        # 'login.username' | 'login.password' | 'notes' | 'fields.<name>'
+  selector="#password",          # CSS selector of the target input, as passed to fill_input
+  target_id="<cdp-target-id>",   # from browser_snapshot / Target.getTargets
+  clear_first=True,              # default; clears any existing value first
+)
+```
+
+Returns only `{"success": true, "field": ..., "chars_written": N, "uri_check": ...}`
+or `{"success": false, "error": ..., "error_kind": ...}` — never the value.
+
+Requirements and guardrails:
+
+- A reachable CDP endpoint (`browser.cdp_url` in `config.yaml`, same
+  requirement as the built-in `browser_cdp` tool) — connect a browser tab
+  first (e.g. `new_tab`/`goto_url`) and pass its `target_id`.
+- `item_id` must be in `allowed_item_ids` and inside the configured
+  `collection_id` — same allowlist boundary as env-bound secrets, no
+  free-form item-name lookup at this layer.
+- **Cross-origin guard**: if the item has Bitwarden `login.uris` configured,
+  the current page's hostname must match one of them, or the fill is refused
+  before anything is written. Items with no configured URIs skip this check
+  (reported in `uri_check`) — set `login.uris` on the item for a hard
+  guarantee.
+- Never precede this call with a fetch/lookup of the same field into the
+  conversation "just to check it" — that defeats the whole point. If the
+  fill fails, read `error`/`error_kind` (never a raw exception message can
+  leak the value by design) and retry the tool call, don't fall back to
+  fetching the raw value.
+- This tool is orthogonal to the env-var flow above: use env bindings for
+  non-interactive tools (terminal/HTTP), use `vaultwarden_browser_fill` only
+  for typing into a live browser form.
+
 ## How agents actually consume a secret (no browser_vault_*, no fetch code)
 
 This plugin's whole job ends at Hermes' gateway startup: it resolves each
@@ -224,9 +268,9 @@ process at execution time (and only if the variable is declared in
 see `secrets.md#secrets-in-child-processes` in the Hermes docs).
 
 **This only works for non-interactive tools that read environment
-variables** (terminal commands, HTTP requests, scripts). It does **not**
-apply to typing a password into a live browser form — there is no
-`env.<VAR>` equivalent for that.
+variables** (terminal commands, HTTP requests, scripts). For typing a
+credential into a *live browser form*, use `vaultwarden_browser_fill` (see
+above) instead — there is no `env.<VAR>` equivalent for that case.
 
 ### `browser_vault_*` is a different, unrelated system — never use it for this plugin's secrets
 
@@ -240,16 +284,19 @@ the operator has no such subscription, this backend is permanently
 `locked`/`unavailable_in_this_session`; that is not a transient state to
 wait out, it is a dead end.
 
-If a task needs a secret that this plugin manages, the only two ways to
-reach it are:
+If a task needs a secret that this plugin manages, there are three ways to
+reach it — never `browser_vault_*` as a workaround for any of them:
 
 1. A shell/env-based tool (see above) — works today for whatever is already
    bound in `plugins.entries.hermes-vaultwarden.settings.env`.
-2. The secret isn't bound yet: ask the operator to add an `env:` binding for
-   it (`hermes vaultwarden lookup` to find the UUID, then `hermes config
-   set plugins.entries.hermes-vaultwarden.settings.env ...`, then restart
-   the gateway) — never reach for `browser_vault_*` as a workaround, and
-   never suggest the operator "unlock Bitwarden" for this plugin's secrets.
+2. Typing into a live browser form — use `vaultwarden_browser_fill` (see
+   above); the item must be in `allowed_item_ids`.
+3. The secret isn't bound/allowlisted yet: ask the operator to add an `env:`
+   binding or extend `allowed_item_ids` (`hermes vaultwarden lookup` to find
+   the UUID, then `hermes config set
+   plugins.entries.hermes-vaultwarden.settings.env/allowed_item_ids ...`,
+   then restart the gateway for env bindings) — never suggest the operator
+   "unlock Bitwarden" for this plugin's secrets.
 
 ## Pitfalls
 
