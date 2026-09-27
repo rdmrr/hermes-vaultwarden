@@ -42,16 +42,28 @@ from urllib.parse import urlparse
 
 from agent.secret_sources.base import ErrorKind, get_source_environment, is_valid_env_name
 
-from vaultwarden_secret_source import (
-    _BASE_CHILD_ENV,
-    _BW_CLI_VERSION,
-    _BwFailure,
-    _canonical_uuid,
-    _field_value,
-    _open_pinned_executable,
-    _positive_timeout,
-    _run_pinned_bw,
-)
+try:
+    from vaultwarden_secret_source import (
+        _BASE_CHILD_ENV,
+        _BW_CLI_VERSION,
+        _BwFailure,
+        _canonical_uuid,
+        _field_value,
+        _open_pinned_executable,
+        _positive_timeout,
+        _run_pinned_bw,
+    )
+except ModuleNotFoundError:
+    from . import (
+        _BASE_CHILD_ENV,
+        _BW_CLI_VERSION,
+        _BwFailure,
+        _canonical_uuid,
+        _field_value,
+        _open_pinned_executable,
+        _positive_timeout,
+        _run_pinned_bw,
+    )
 
 _MIN_FILL_TIMEOUT_SECONDS = 3.0
 _DEFAULT_FILL_TIMEOUT_SECONDS = 30.0

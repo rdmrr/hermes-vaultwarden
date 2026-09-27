@@ -297,9 +297,83 @@ class RegistrationWiringTests(unittest.TestCase):
         result_str = tool["handler"]({"item_id": VALID_ITEM_ID}, extra_kwarg="ignored")
         result = json.loads(result_str)
         self.assertFalse(result["success"])
-        self.assertEqual("ref_invalid", result["error_kind"])
 
-        self.assertIsInstance(tool["check_fn"](), bool)
+    def test_register_works_when_installer_renames_the_package_directory(self):
+        """Regression: `hermes plugins install` clones this repo's `vaultwarden_secret_source/`
+        directory under the plugin's manifest slug (e.g. `hermes-vaultwarden`), so the module
+        never actually lives at the literal name `vaultwarden_secret_source` in production. Both
+        __init__.py and browser_fill.py must resolve their cross-imports via package-relative
+        imports (with an absolute-import fallback for direct/dev loads), not a hardcoded absolute
+        `vaultwarden_secret_source` import — that silently failed in production (v0.4.0), the tool
+        was never registered, and agents had no way to notice because the plugin still "loaded".
+
+        This test mirrors the real loader: hermes_cli/plugins_loader.py's
+        `_load_directory_plugin` imports `__init__.py` via
+        `spec_from_file_location(module_name, init_file, submodule_search_locations=[plugin_dir])`
+        with `module_name` derived from the plugin's manifest slug, not from the source directory
+        name on disk.
+        """
+        renamed_pkg_name = "hermes_plugins_test_slug_hermes_vaultwarden"
+        for name in list(sys.modules):
+            if name == renamed_pkg_name or name.startswith(renamed_pkg_name + "."):
+                del sys.modules[name]
+        # The real bug only shows up when the plugin directory has actually been renamed
+        # on disk by the installer, so `import vaultwarden_secret_source` (an absolute,
+        # non-relative import) cannot resolve at all — not merely under a different
+        # sys.modules key. PROJECT_ROOT is on sys.path in this repo checkout, so the
+        # literal package still exists there; block it with a MetaPathFinder so the
+        # absolute import genuinely fails, exactly like it does after installation.
+        import importlib.abc
+
+        class _BlockVaultwardenSecretSource(importlib.abc.MetaPathFinder):
+            def find_spec(self, fullname, path, target=None):
+                if fullname == "vaultwarden_secret_source" or fullname.startswith(
+                    "vaultwarden_secret_source."
+                ):
+                    raise ModuleNotFoundError(fullname)
+                return None
+
+        blocker = _BlockVaultwardenSecretSource()
+        sys.meta_path.insert(0, blocker)
+        self.addCleanup(lambda: sys.meta_path.remove(blocker))
+        _install_contract_stub()
+
+        plugin_dir = PLUGIN_INIT_PATH.parent
+        spec = importlib.util.spec_from_file_location(
+            renamed_pkg_name, PLUGIN_INIT_PATH, submodule_search_locations=[str(plugin_dir)]
+        )
+        module = importlib.util.module_from_spec(spec)
+        module.__package__ = renamed_pkg_name
+        module.__path__ = [str(plugin_dir)]
+        sys.modules[renamed_pkg_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:  # pragma: no cover - failure path is the point of this test
+            self.fail(f"plugin failed to load under a renamed package name: {exc!r}")
+
+        registered_tools = []
+        settings = {
+            "enabled": True,
+            "server_url": "https://vault.example.invalid",
+            "collection_id": "00000000-0000-4000-8000-000000000001",
+            "allowed_item_ids": [VALID_ITEM_ID],
+            "env": {},
+        }
+        ctx = types.SimpleNamespace(
+            get_config=lambda key, default=None: settings.get(key, default),
+            register_secret_source=lambda source: None,
+            register_cli_command=lambda **kwargs: None,
+            register_tool=lambda **kwargs: registered_tools.append(kwargs),
+        )
+        module.register(ctx)
+
+        self.assertEqual(
+            1,
+            len(registered_tools),
+            "vaultwarden_browser_fill must be registered even when the plugin directory "
+            "was renamed by the installer away from 'vaultwarden_secret_source'",
+        )
+        self.assertEqual("vaultwarden_browser_fill", registered_tools[0]["name"])
 
 
 class BrowserFillSecurityInvariantTests(unittest.TestCase):

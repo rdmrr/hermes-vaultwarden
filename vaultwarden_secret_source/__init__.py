@@ -1095,11 +1095,18 @@ def register(ctx) -> None:
         description="Safe UUID lookup, status, doctor, and configuration help.",
     )
     try:
-        from vaultwarden_secret_source.browser_fill import (
-            VAULTWARDEN_BROWSER_FILL_SCHEMA,
-            check_vaultwarden_browser_fill,
-            handle_vaultwarden_browser_fill,
-        )
+        try:
+            from vaultwarden_secret_source.browser_fill import (
+                VAULTWARDEN_BROWSER_FILL_SCHEMA,
+                check_vaultwarden_browser_fill,
+                handle_vaultwarden_browser_fill,
+            )
+        except ModuleNotFoundError:
+            from .browser_fill import (
+                VAULTWARDEN_BROWSER_FILL_SCHEMA,
+                check_vaultwarden_browser_fill,
+                handle_vaultwarden_browser_fill,
+            )
         ctx.register_tool(
             name="vaultwarden_browser_fill",
             toolset="hermes-vaultwarden",
