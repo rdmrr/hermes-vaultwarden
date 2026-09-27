@@ -118,23 +118,61 @@ def _run_async(coro):
     return asyncio.run(coro)
 
 
-def _resolve_cdp_endpoint() -> str:
+def _resolve_dynamic_session_cdp_endpoint(task_id: Optional[str]) -> str:
+    """Best-effort: reuse the *live* CDP endpoint of the calling agent's own active
+    browser_exec/browser_vault session (same Hermes gateway process, in-memory registry),
+    exactly like Hermes' built-in ``browser_vault_fill`` does via
+    ``tools.browser_vault_tool._ensure_supervisor`` / ``tools.browser_tool._last_session_key``.
+
+    This is intentionally a SOFT dependency: those are internal, unversioned Hermes modules.
+    Any import/lookup failure here must fall through silently to the static
+    ``BROWSER_CDP_URL``/``browser.cdp_url`` precedence in ``_resolve_cdp_endpoint`` — never raise,
+    never block the tool when Hermes' internals shift. Without this, the tool only ever worked
+    when an operator had hardcoded a fixed local CDP port, which no profile in production does
+    (browser sessions are started dynamically, per task, by browser_exec itself).
+    """
+    if not task_id:
+        return ""
+    try:
+        from tools.browser_tool import _last_session_key
+        from tools.browser_tool_session import _run_browser_command
+
+        session_key = _last_session_key(task_id)
+        res = _run_browser_command(session_key, "get", ["cdp-url"])
+        if not (res or {}).get("success"):
+            return ""
+        cdp = str(((res or {}).get("data") or {}).get("cdpUrl") or "").strip()
+        return cdp
+    except Exception:  # noqa: BLE001 - internal module shape may change; never break the tool
+        return ""
+
+
+def _resolve_cdp_endpoint(task_id: Optional[str] = None) -> str:
     """Same precedence as the built-in ``browser_cdp`` tool (``BROWSER_CDP_URL`` env, then
     ``browser.cdp_url``), reimplemented here rather than imported from ``tools.browser_*``
-    per the VW-018 decision to keep this plugin free of a hard dependency on Hermes' internal
-    browser-tool modules — only the documented config read is used."""
-    import os
+    per the VW-018 decision to keep this plugin free of a HARD dependency on Hermes' internal
+    browser-tool modules — the documented config read remains the fallback of last resort.
 
-    raw = os.environ.get("BROWSER_CDP_URL", "").strip()
-    if not raw:
-        try:
-            from hermes_cli.config import load_config_readonly
+    Before that static precedence, try the calling agent's own live browser session (see
+    ``_resolve_dynamic_session_cdp_endpoint``): every production profile starts browser sessions
+    dynamically per task, so a fixed ``browser.cdp_url`` is essentially never configured.
+    """
+    dynamic = _resolve_dynamic_session_cdp_endpoint(task_id)
+    if dynamic:
+        raw = dynamic
+    else:
+        import os
 
-            cfg = load_config_readonly() or {}
-            browser_cfg = cfg.get("browser") if isinstance(cfg.get("browser"), dict) else {}
-            raw = str(browser_cfg.get("cdp_url", "") or "").strip()
-        except Exception:  # noqa: BLE001 - config read must never break the tool
-            raw = ""
+        raw = os.environ.get("BROWSER_CDP_URL", "").strip()
+        if not raw:
+            try:
+                from hermes_cli.config import load_config_readonly
+
+                cfg = load_config_readonly() or {}
+                browser_cfg = cfg.get("browser") if isinstance(cfg.get("browser"), dict) else {}
+                raw = str(browser_cfg.get("cdp_url", "") or "").strip()
+            except Exception:  # noqa: BLE001 - config read must never break the tool
+                raw = ""
     if not raw:
         return ""
     if "/devtools/browser/" in raw.lower():
@@ -345,7 +383,8 @@ def handle_vaultwarden_browser_fill(args: Dict[str, Any], settings: Dict[str, An
             return _status(False, error="The 'websockets' Python package is required but not installed.",
                            error_kind=ErrorKind.BINARY_MISSING.value)
 
-        endpoint = _resolve_cdp_endpoint()
+        task_id = _kwargs.get("task_id")
+        endpoint = _resolve_cdp_endpoint(task_id)
         if not endpoint:
             return _status(False, error=("No CDP endpoint is available. Run '/browser connect' to attach to a "
                                           "running Chromium-family browser, or set 'browser.cdp_url' in config.yaml."),
@@ -489,5 +528,15 @@ VAULTWARDEN_BROWSER_FILL_SCHEMA: Dict[str, Any] = {
 
 
 def check_vaultwarden_browser_fill(settings: Dict[str, Any]) -> bool:
-    """Availability gate: no network I/O (matches browser_cdp's own check_fn contract)."""
-    return bool(_WS_AVAILABLE and settings.get("enabled") is True and _cdp_endpoint_configured_raw())
+    """Availability gate: no network I/O, no per-task context available here (matches
+    ``browser_cdp``'s own check_fn contract — ``check_fn`` is always called with zero
+    arguments, see ``tools/registry.py::_run_check_fn_uncached``).
+
+    Deliberately does NOT require a static ``browser.cdp_url``/``BROWSER_CDP_URL`` to be
+    configured: in production, every profile starts its browser session dynamically per task
+    (browser_exec), so no fixed endpoint exists until a task is actually running one. The
+    handler resolves the real, live endpoint per call via ``_resolve_cdp_endpoint(task_id)``
+    and fails closed with a clear NOT_CONFIGURED status if no session is active at call time —
+    that per-call check is the correct place to fail, not tool visibility.
+    """
+    return bool(_WS_AVAILABLE and settings.get("enabled") is True)

@@ -437,5 +437,67 @@ class BrowserFillSecurityInvariantTests(unittest.TestCase):
                 )
 
 
+class DynamicCdpEndpointResolutionTests(unittest.TestCase):
+    """v0.4.2 fix: the tool only ever worked when an operator hardcoded a static
+    ``browser.cdp_url`` in config.yaml, which no production profile does — browser sessions
+    are started dynamically per task by browser_exec itself. ``_resolve_cdp_endpoint`` must
+    reuse that live, per-task session before falling back to the static config precedence."""
+
+    def setUp(self):
+        self.module = _load_browser_fill()
+
+    def test_prefers_the_live_per_task_session_endpoint_over_static_config(self):
+        fake_browser_tool = types.ModuleType("tools.browser_tool")
+        fake_browser_tool._last_session_key = lambda task_id: f"session-for-{task_id}"
+
+        fake_browser_tool_session = types.ModuleType("tools.browser_tool_session")
+
+        def _fake_run_browser_command(session_key, verb, args):
+            self.assertEqual("get", verb)
+            self.assertEqual(["cdp-url"], args)
+            return {
+                "success": True,
+                "data": {"cdpUrl": f"ws://127.0.0.1:9999/devtools/browser/{session_key}"},
+            }
+
+        fake_browser_tool_session._run_browser_command = _fake_run_browser_command
+
+        sys.modules["tools.browser_tool"] = fake_browser_tool
+        sys.modules["tools.browser_tool_session"] = fake_browser_tool_session
+        self.addCleanup(sys.modules.pop, "tools.browser_tool", None)
+        self.addCleanup(sys.modules.pop, "tools.browser_tool_session", None)
+
+        endpoint = self.module._resolve_cdp_endpoint("my-task-id")
+        self.assertEqual("ws://127.0.0.1:9999/devtools/browser/session-for-my-task-id", endpoint)
+
+    def test_falls_back_to_static_config_when_no_live_session_exists(self):
+        # No tools.browser_tool / tools.browser_tool_session available (or they raise/return
+        # failure) — must fall through silently to BROWSER_CDP_URL, never raise.
+        import os
+
+        os.environ["BROWSER_CDP_URL"] = "ws://127.0.0.1:1234/devtools/browser/static-fallback"
+        self.addCleanup(os.environ.pop, "BROWSER_CDP_URL", None)
+
+        endpoint = self.module._resolve_cdp_endpoint("some-task-with-no-active-session")
+        self.assertEqual("ws://127.0.0.1:1234/devtools/browser/static-fallback", endpoint)
+
+    def test_missing_task_id_falls_back_to_static_config_without_raising(self):
+        import os
+
+        os.environ["BROWSER_CDP_URL"] = "ws://127.0.0.1:1234/devtools/browser/no-task-id"
+        self.addCleanup(os.environ.pop, "BROWSER_CDP_URL", None)
+
+        endpoint = self.module._resolve_cdp_endpoint(None)
+        self.assertEqual("ws://127.0.0.1:1234/devtools/browser/no-task-id", endpoint)
+
+    def test_check_fn_no_longer_requires_a_static_cdp_url(self):
+        """check_fn is always called with zero arguments (tools/registry.py's
+        _run_check_fn_uncached), so it cannot know whether a live per-task session exists.
+        It must only gate on cheap, context-free preconditions (websockets installed, plugin
+        enabled) — the per-call handler is where a missing live session correctly fails."""
+        settings = {"enabled": True}
+        self.assertTrue(self.module.check_vaultwarden_browser_fill(settings))
+
+
 if __name__ == "__main__":
     unittest.main()
